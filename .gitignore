@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Config (contains credentials)
+jeanirotrabot_config.json
+
+# Logs
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
