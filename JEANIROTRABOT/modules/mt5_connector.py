@@ -306,17 +306,103 @@ class MT5Connector:
             for d in deals
         ]
 
+    def close_position(self, ticket: int, comment: str = "AI_CLOSE") -> OrderResult:
+        """Close a specific position by ticket number."""
+        if not self._connected or not MT5_AVAILABLE:
+            return OrderResult(success=False, comment="Not connected to MT5.")
+
+        positions = self.get_positions()
+        pos = None
+        for p in positions:
+            if p["ticket"] == ticket:
+                pos = p
+                break
+        if pos is None:
+            return OrderResult(success=False, comment=f"Position {ticket} not found.")
+
+        close_type = "sell" if pos["type"] == "BUY" else "buy"
+        return self.send_market_order(
+            symbol=pos["symbol"],
+            order_type=close_type,
+            volume=pos["volume"],
+            comment=comment,
+        )
+
+    def close_positions_by_symbol(self, symbol: str, comment: str = "AI_CLOSE") -> list[OrderResult]:
+        """Close all positions for a specific symbol."""
+        results = []
+        positions = self.get_positions()
+        for pos in positions:
+            if pos["symbol"] == symbol:
+                result = self.close_position(pos["ticket"], comment)
+                results.append(result)
+        return results
+
+    def modify_position_sl_tp(self, ticket: int, sl: float = 0.0, tp: float = 0.0) -> OrderResult:
+        """Modify SL/TP on an existing position."""
+        if not self._connected or not MT5_AVAILABLE:
+            return OrderResult(success=False, comment="Not connected to MT5.")
+
+        with self._lock:
+            position = mt5.positions_get(ticket=ticket)
+            if position is None or len(position) == 0:
+                return OrderResult(success=False, comment=f"Position {ticket} not found.")
+
+            pos = position[0]
+            request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": pos.symbol,
+                "position": ticket,
+                "sl": sl if sl > 0 else pos.sl,
+                "tp": tp if tp > 0 else pos.tp,
+            }
+            result = mt5.order_send(request)
+
+        if result is None:
+            return OrderResult(success=False, comment="modify order_send returned None.")
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            return OrderResult(success=False, retcode=result.retcode, comment=result.comment)
+
+        logger.info(f"Position {ticket} modified: SL={sl}, TP={tp}")
+        return OrderResult(success=True, ticket=ticket, comment="SL/TP modified.")
+
+    def get_symbol_info(self, symbol: str) -> Optional[dict]:
+        """Get detailed symbol information (point, spread, lot sizes, etc.)."""
+        if not self._connected or not MT5_AVAILABLE:
+            return None
+        with self._lock:
+            info = mt5.symbol_info(symbol)
+        if info is None:
+            return None
+        tick = self.get_tick(symbol)
+        spread = (tick["ask"] - tick["bid"]) if tick else 0.0
+        return {
+            "symbol": info.name,
+            "point": info.point,
+            "digits": info.digits,
+            "spread": round(spread / info.point) if info.point > 0 else 0,
+            "spread_price": spread,
+            "volume_min": info.volume_min,
+            "volume_max": info.volume_max,
+            "volume_step": info.volume_step,
+            "trade_contract_size": info.trade_contract_size,
+            "trade_tick_value": info.trade_tick_value,
+            "trade_tick_size": info.trade_tick_size,
+        }
+
+    def get_positions_count(self) -> int:
+        """Get total number of open positions."""
+        if not self._connected or not MT5_AVAILABLE:
+            return 0
+        with self._lock:
+            positions = mt5.positions_total()
+        return positions if positions else 0
+
     def close_all_positions(self) -> list[OrderResult]:
         """Close all open positions (Emergency Stop)."""
         results = []
         positions = self.get_positions()
         for pos in positions:
-            close_type = "sell" if pos["type"] == "BUY" else "buy"
-            result = self.send_market_order(
-                symbol=pos["symbol"],
-                order_type=close_type,
-                volume=pos["volume"],
-                comment="EMERGENCY_CLOSE",
-            )
+            result = self.close_position(pos["ticket"], "EMERGENCY_CLOSE")
             results.append(result)
         return results

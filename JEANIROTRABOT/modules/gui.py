@@ -149,37 +149,55 @@ class JeaniroTrabotApp:
         self.cmb_symbol.grid(row=0, column=1, padx=5, pady=2)
         self.cmb_symbol.set("EURUSD")
 
-        ttkb.Label(lf_trade, text="Timeframe:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        # Multi-symbol entry
+        ttkb.Label(lf_trade, text="Symbols:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        self.ent_symbols = ttkb.Entry(lf_trade, width=18)
+        self.ent_symbols.grid(row=1, column=1, padx=5, pady=2)
+        saved_symbols = self.config.get("TRADE_SYMBOLS", "EURUSD")
+        self.ent_symbols.insert(0, saved_symbols)
+
+        ttkb.Label(lf_trade, text="Timeframe:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
         self.cmb_tf = ttkb.Combobox(
             lf_trade, width=16, state="readonly",
             values=["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
         )
-        self.cmb_tf.grid(row=1, column=1, padx=5, pady=2)
+        self.cmb_tf.grid(row=2, column=1, padx=5, pady=2)
         self.cmb_tf.set("M5")
         self.cmb_tf.bind("<<ComboboxSelected>>", lambda e: self._refresh_chart())
 
-        ttkb.Label(lf_trade, text="Lot Size:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
+        ttkb.Label(lf_trade, text="Lot Size:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=2)
         self.spn_lot = ttkb.Spinbox(lf_trade, from_=0.01, to=10.0, increment=0.01, width=14)
-        self.spn_lot.grid(row=2, column=1, padx=5, pady=2)
+        self.spn_lot.grid(row=3, column=1, padx=5, pady=2)
         self.spn_lot.set("0.01")
+
+        # Autonomy level
+        ttkb.Label(lf_trade, text="AI Mode:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=2)
+        self.cmb_autonomy = ttkb.Combobox(
+            lf_trade, width=16, state="readonly",
+            values=["Full Autonomous", "Open + Close", "Signals Only"]
+        )
+        self.cmb_autonomy.grid(row=4, column=1, padx=5, pady=2)
+        saved_level = self.config.get("AI_AUTONOMY_LEVEL", "full")
+        level_map = {"full": "Full Autonomous", "open_close": "Open + Close", "signals_only": "Signals Only"}
+        self.cmb_autonomy.set(level_map.get(saved_level, "Full Autonomous"))
 
         self.btn_start = ttkb.Button(
             lf_trade, text="Start Robot", bootstyle="success",
             command=self._on_start_robot
         )
-        self.btn_start.grid(row=3, column=0, columnspan=2, padx=5, pady=3, sticky=tk.EW)
+        self.btn_start.grid(row=5, column=0, columnspan=2, padx=5, pady=3, sticky=tk.EW)
 
         self.btn_stop = ttkb.Button(
             lf_trade, text="Stop Robot", bootstyle="secondary",
             command=self._on_stop_robot, state=tk.DISABLED
         )
-        self.btn_stop.grid(row=4, column=0, columnspan=2, padx=5, pady=3, sticky=tk.EW)
+        self.btn_stop.grid(row=6, column=0, columnspan=2, padx=5, pady=3, sticky=tk.EW)
 
         self.btn_emergency = ttkb.Button(
             lf_trade, text="EMERGENCY STOP", bootstyle="danger",
             command=self._on_emergency_stop
         )
-        self.btn_emergency.grid(row=5, column=0, columnspan=2, padx=5, pady=5, sticky=tk.EW)
+        self.btn_emergency.grid(row=7, column=0, columnspan=2, padx=5, pady=5, sticky=tk.EW)
 
         # Risk Management
         lf_risk = ttkb.Labelframe(parent, text="Risk Management", bootstyle="danger")
@@ -437,14 +455,28 @@ class JeaniroTrabotApp:
             messagebox.showerror("Connection Error", msg)
 
     def _on_start_robot(self):
-        symbol = self.cmb_symbol.get()
+        # Parse multi-symbol list
+        symbols_text = self.ent_symbols.get().strip()
+        if symbols_text:
+            symbols = [s.strip() for s in symbols_text.replace(";", ",").split(",") if s.strip()]
+        else:
+            symbols = [self.cmb_symbol.get()]
+
         tf = self.cmb_tf.get()
         try:
             lot = float(self.spn_lot.get())
         except ValueError:
             lot = 0.01
 
-        self.engine.set_symbol(symbol)
+        # Save autonomy level
+        autonomy_text = self.cmb_autonomy.get()
+        level_rmap = {"Full Autonomous": "full", "Open + Close": "open_close", "Signals Only": "signals_only"}
+        autonomy = level_rmap.get(autonomy_text, "full")
+        self.config.set("AI_AUTONOMY_LEVEL", autonomy)
+        self.config.set("TRADE_SYMBOLS", ",".join(symbols))
+        self.config.save()
+
+        self.engine.set_symbols(symbols)
         self.engine.set_timeframe(tf)
         self.engine.set_lot_size(lot)
 
@@ -452,7 +484,8 @@ class JeaniroTrabotApp:
         if ok:
             self.btn_start.configure(state=tk.DISABLED)
             self.btn_stop.configure(state=tk.NORMAL)
-            self._append_log(f"Robot started: {symbol} {tf} lot={lot}")
+            symbols_str = ", ".join(symbols)
+            self._append_log(f"Robot started: [{symbols_str}] {tf} lot={lot} mode={autonomy}")
         else:
             messagebox.showwarning("Start Failed", msg)
 

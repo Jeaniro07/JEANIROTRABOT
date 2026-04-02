@@ -40,6 +40,15 @@ DEFAULTS = {
     "MAX_LOT_SIZE": "1.0",
     "DEFAULT_SL_POINTS": "100",
     "DEFAULT_TP_POINTS": "200",
+    # Autonomous trading settings
+    "TRADE_SYMBOLS": "EURUSD",
+    "AI_AUTONOMY_LEVEL": "full",
+    "MAX_POSITIONS_TOTAL": "5",
+    "MAX_POSITIONS_PER_SYMBOL": "1",
+    "RISK_PER_TRADE_PERCENT": "1.0",
+    "TRAILING_STOP_POINTS": "0",
+    "POSITION_REVIEW_ENABLED": "true",
+    "AI_AUTO_EXECUTE": "true",
 }
 
 
