@@ -27,6 +27,7 @@ from modules.news_agent import NewsAgent
 from modules.research_agent import ResearchAgent
 from modules.composer_agent import ComposerAgent, MARKET_MODES
 from modules.exchange_connector import ExchangeConnector, SUPPORTED_EXCHANGES
+from modules.animation_manager import AnimationManager
 
 logger = logging.getLogger("JEANIROTRABOT.gui")
 
@@ -85,6 +86,13 @@ class JeaniroTrabotApp:
 
         self._build_ui()
         self._start_refresh_timer()
+
+        # AnimationManager — inisialisasi setelah _build_ui() agar widget sudah ada
+        self.anim = AnimationManager(self.root)
+        self.anim.register_pnl_labels(self.acc_labels)
+        self.anim.register_gauge(self.gauge_canvas, None)
+        self.anim.register_badge("composer", self.badge_composer)
+        self.anim.start()
 
         # Auto-connect MT5 jika credentials tersimpan (Fix K)
         if (self.config.get("MT5_SERVER") and
@@ -868,12 +876,16 @@ class JeaniroTrabotApp:
 
     def _update_display(self, info, positions, history):
         if info:
-            self.acc_labels["Balance"].configure(text=f"{info.balance:,.2f} {info.currency}")
-            self.acc_labels["Equity"].configure(text=f"{info.equity:,.2f}")
             self.acc_labels["Margin"].configure(text=f"{info.margin:,.2f}")
             self.acc_labels["Free Margin"].configure(text=f"{info.free_margin:,.2f}")
-            color = ACCENT_GREEN if info.profit >= 0 else ACCENT_RED
-            self.acc_labels["Profit"].configure(text=f"{info.profit:,.2f}", foreground=color)
+            # Animated P&L (count-up + flash)
+            self.anim.update_pnl(info.balance, info.equity, info.profit, info.currency)
+            # Profit gauge
+            if hasattr(self.composer, "_initial_balance") and self.composer._initial_balance > 0:
+                pct = ((info.equity - self.composer._initial_balance)
+                       / self.composer._initial_balance * 100)
+                target = self.config.get_float("PROFIT_TARGET_PERCENT", 70.0)
+                self.anim.update_profit_gauge(pct, target)
 
         self.tree_positions.delete(*self.tree_positions.get_children())
         for p in positions:
@@ -936,6 +948,14 @@ class JeaniroTrabotApp:
         # Mirror Composer logs
         if "[COMPOSER]" in msg or "Composer" in msg:
             self._append_composer_log(msg.replace("[COMPOSER] ", ""))
+        # Trade toast notification
+        if "AUTO-EXECUTE:" in msg and hasattr(self, "anim"):
+            parsed = AnimationManager.parse_trade_log(msg)
+            if parsed and parsed.get("action") in ("BUY", "SELL"):
+                self.anim.show_trade_toast(
+                    parsed["action"], parsed["symbol"],
+                    parsed["lot"], parsed["price"], parsed["pnl"]
+                )
 
     def _append_log_threadsafe(self, msg: str):
         self.root.after(0, lambda: self._append_log(msg))
@@ -1101,6 +1121,9 @@ class JeaniroTrabotApp:
         color = mode_params.get("color", "#ffffff")
         desc = mode_params.get("description", "")
         self.root.after(0, lambda: self._update_composer_display(mode, color, desc))
+        # Update badge
+        if hasattr(self, "anim"):
+            self.anim.set_agent_state("composer", "active")
 
     def _update_composer_display(self, mode: str, color: str, desc: str):
         self.lbl_composer_mode.configure(text=f"Mode: {mode}", foreground=color)
@@ -1117,6 +1140,8 @@ class JeaniroTrabotApp:
     def _on_close(self):
         if self.engine.running:
             self.engine.stop()
+        if hasattr(self, "anim"):
+            self.anim.stop()
         self.connector.disconnect()
         if self.exchange_connector and self.exchange_connector.connected:
             self.exchange_connector.disconnect()
