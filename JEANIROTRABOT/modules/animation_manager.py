@@ -112,7 +112,7 @@ class AnimationManager:
         self._running = False
         self._tasks: dict[str, AnimTask] = {}
         self._toasts: list = []
-        self._after_id: Optional[str] = None
+        self._after_id: Optional[int] = None
 
         self._pnl_labels: dict = {}
         self._gauge_canvas: Optional[tk.Canvas] = None
@@ -208,7 +208,7 @@ class AnimationManager:
         try:
             task.widget.configure(text=f"{fmt.format(current)} {currency}".strip())
         except Exception:
-            pass
+            task.active = False
 
     def _step_flash(self, task: AnimTask):
         d = task.data
@@ -219,7 +219,7 @@ class AnimationManager:
         try:
             task.widget.configure(foreground=color)
         except Exception:
-            pass
+            task.active = False
 
     def _step_pulse(self, task: AnimTask):
         d = task.data
@@ -245,7 +245,7 @@ class AnimationManager:
         try:
             task.widget.configure(text=char)
         except Exception:
-            pass
+            task.active = False
 
     def _step_ease_bar(self, task: AnimTask):
         d = task.data
@@ -435,7 +435,12 @@ class AnimationManager:
         still_alive = []
         for toast in self._toasts:
             done = toast.tick()
-            if not done:
+            if done:
+                try:
+                    toast.destroy()
+                except Exception:
+                    pass
+            else:
                 still_alive.append(toast)
         self._toasts = still_alive
         if still_alive:
