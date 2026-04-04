@@ -1,9 +1,12 @@
 """
 JEANIROTRABOT - Multi-Provider AI Trading Agent (Full Autonomous)
 Supports: OpenAI, Anthropic Claude, Google Gemini, DeepSeek, Groq, xAI Grok,
-          and any OpenAI-compatible API (Ollama, LM Studio, etc.)
+          OpenRouter, SiliconFlow, Azure OpenAI, and any OpenAI-compatible API.
 
-The AI agent can: BUY, SELL, CLOSE, CLOSE_ALL, MODIFY_SL_TP, HOLD
+The AI agent can:
+  BUY, SELL, HOLD, CLOSE, CLOSE_ALL, MODIFY_SL_TP (original 6)
+  SCAN_MARKET, SELECT_SYMBOLS, SET_SESSION_END, EARLY_TP, END_DAY, SCALE_IN, SCALE_OUT (new 7)
+
 All executions are automatic — no user confirmation needed.
 """
 
@@ -75,40 +78,80 @@ PROVIDERS = {
         "key_prefix": "",
         "key_hint": "any-key-or-empty",
     },
+    "OpenRouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "models": ["meta-llama/llama-3.1-8b-instruct:free", "google/gemini-2.0-flash-exp:free",
+                   "openai/gpt-4o-mini", "anthropic/claude-3.5-haiku", "mistralai/mistral-7b-instruct:free"],
+        "default_model": "meta-llama/llama-3.1-8b-instruct:free",
+        "key_prefix": "sk-or-",
+        "key_hint": "sk-or-xxxxxxxx",
+        "extra_headers": {"HTTP-Referer": "https://jeanirotrabot.app", "X-Title": "JEANIROTRABOT"},
+    },
+    "SiliconFlow": {
+        "base_url": "https://api.siliconflow.cn/v1",
+        "models": ["Qwen/Qwen2.5-7B-Instruct", "deepseek-ai/DeepSeek-V2.5",
+                   "THUDM/glm-4-9b-chat", "Qwen/Qwen2.5-72B-Instruct"],
+        "default_model": "Qwen/Qwen2.5-7B-Instruct",
+        "key_prefix": "sf-",
+        "key_hint": "sf-xxxxxxxx",
+    },
+    "Azure OpenAI": {
+        "base_url": "",  # User wajib isi endpoint Azure
+        "models": ["gpt-4o", "gpt-4o-mini", "gpt-35-turbo"],
+        "default_model": "gpt-4o",
+        "key_prefix": "",
+        "key_hint": "Azure API Key (dari Azure Portal)",
+    },
 }
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a fully autonomous professional trading AI. You receive complete market data "
-    "(symbol, timeframe, OHLCV, technical indicators, account info, open positions, risk status) "
-    "and must respond with a JSON object containing your trading decision.\n\n"
-    "You execute ALL decisions automatically — no human confirmation is needed.\n\n"
-    "Response format (JSON only, no other text):\n"
+    "Kamu adalah AI trading profesional yang sepenuhnya otonom. Kamu menerima data pasar lengkap "
+    "(simbol, timeframe, OHLCV, indikator teknikal, info akun, posisi terbuka, status risiko) "
+    "dan harus merespons dengan JSON berisi keputusan trading.\n\n"
+    "Kamu menjalankan SEMUA keputusan secara otomatis — tidak ada konfirmasi manusia.\n\n"
+    "Format respons (JSON only, tidak ada teks lain):\n"
     "{\n"
-    '  "action": "BUY" | "SELL" | "HOLD" | "CLOSE" | "CLOSE_ALL" | "MODIFY_SL_TP",\n'
+    '  "action": "BUY|SELL|HOLD|CLOSE|CLOSE_ALL|MODIFY_SL_TP|'
+    'SCAN_MARKET|SELECT_SYMBOLS|SET_SESSION_END|EARLY_TP|END_DAY|SCALE_IN|SCALE_OUT",\n'
     '  "confidence": 0.0-1.0,\n'
-    '  "reason": "brief explanation",\n'
-    '  "sl_points": optional int (custom stop loss in points, omit to use default),\n'
-    '  "tp_points": optional int (custom take profit in points, omit to use default),\n'
-    '  "lot_size": optional float (custom lot size, omit for auto-calculated),\n'
-    '  "ticket": optional int (required for CLOSE and MODIFY_SL_TP actions),\n'
-    '  "new_sl": optional float (exact price, for MODIFY_SL_TP),\n'
-    '  "new_tp": optional float (exact price, for MODIFY_SL_TP)\n'
+    '  "reason": "penjelasan singkat",\n'
+    '  "sl_points": int opsional,\n'
+    '  "tp_points": int opsional,\n'
+    '  "lot_size": float opsional,\n'
+    '  "ticket": int opsional (wajib untuk CLOSE, MODIFY_SL_TP, SCALE_IN, SCALE_OUT, EARLY_TP),\n'
+    '  "new_sl": float opsional (harga exact, untuk MODIFY_SL_TP),\n'
+    '  "new_tp": float opsional (harga exact, untuk MODIFY_SL_TP),\n'
+    '  "new_symbols": ["SYM1","SYM2"] opsional (untuk SELECT_SYMBOLS),\n'
+    '  "session_end": "HH:MM" opsional (untuk SET_SESSION_END),\n'
+    '  "close_percent": int 1-99 opsional (untuk SCALE_OUT, persentase volume ditutup),\n'
+    '  "scale_volume": float opsional (untuk SCALE_IN, volume tambahan),\n'
+    '  "all": bool opsional (untuk EARLY_TP, true = semua posisi)\n'
     "}\n\n"
-    "Actions:\n"
-    "- BUY: Open a long position on the current symbol\n"
-    "- SELL: Open a short position on the current symbol\n"
-    "- HOLD: Do nothing, wait for better setup\n"
-    "- CLOSE: Close a specific position (provide ticket number)\n"
-    "- CLOSE_ALL: Close all positions on the current symbol\n"
-    "- MODIFY_SL_TP: Modify stop loss / take profit on a position (provide ticket, new_sl/new_tp)\n\n"
-    "Rules:\n"
-    "- Only recommend BUY or SELL when confidence >= 0.6\n"
-    "- Review open positions and close losing trades or take profit when appropriate\n"
-    "- Consider trend (SMA crossover), momentum (RSI), volatility (spread), and price action\n"
-    "- Use account equity and risk status to size positions appropriately\n"
-    "- If data is insufficient or unclear, respond HOLD\n"
-    "- Be conservative; capital preservation is priority\n"
-    "- You may suggest trailing stops by using MODIFY_SL_TP to move SL closer to current price"
+    "AKSI ORIGINAL:\n"
+    "- BUY: Buka posisi long pada simbol saat ini\n"
+    "- SELL: Buka posisi short pada simbol saat ini\n"
+    "- HOLD: Tunggu, tidak ada aksi\n"
+    "- CLOSE: Tutup posisi tertentu (sertakan ticket)\n"
+    "- CLOSE_ALL: Tutup semua posisi pada simbol ini\n"
+    "- MODIFY_SL_TP: Modifikasi SL/TP posisi (sertakan ticket, new_sl/new_tp)\n\n"
+    "AKSI SELF-CONFIGURE (baru):\n"
+    "- SCAN_MARKET: Minta scan semua simbol tersedia untuk temukan peluang terbaik\n"
+    "- SELECT_SYMBOLS: Ganti daftar simbol aktif trading (sertakan new_symbols)\n"
+    "- SET_SESSION_END: Set waktu akhir trading hari ini (sertakan session_end HH:MM)\n"
+    "- EARLY_TP: Ambil profit sekarang sebelum pasar berbalik (ticket atau all=true)\n"
+    "- END_DAY: Tidak ada peluang hari ini — hentikan trading sampai besok\n"
+    "- SCALE_IN: Tambah volume ke posisi existing (ticket + scale_volume)\n"
+    "- SCALE_OUT: Tutup sebagian posisi untuk amankan profit (ticket + close_percent)\n\n"
+    "ATURAN:\n"
+    "- BUY/SELL hanya jika confidence >= threshold yang ditetapkan\n"
+    "- Gunakan SCAN_MARKET jika tidak ada setup bagus di simbol saat ini\n"
+    "- Gunakan END_DAY setelah scan jika tidak ada peluang di semua pasar\n"
+    "- Gunakan SET_SESSION_END untuk batasi trading jika kondisi tidak ideal\n"
+    "- Gunakan EARLY_TP jika indikator menunjukkan momentum akan berbalik\n"
+    "- Gunakan SCALE_OUT untuk amankan profit parsial saat profit > 50% dari TP\n"
+    "- Pertimbangkan tren (SMA crossover), momentum (RSI), volatilitas (spread)\n"
+    "- Preservasi modal adalah prioritas utama\n"
+    "- Jika data tidak cukup, respond HOLD"
 )
 
 
@@ -344,8 +387,39 @@ class AIAgent:
             default["reason"] = f"AI error: {str(e)}"
             return default
 
+    def analyze_raw(self, prompt: str, max_tokens: int = 800) -> dict:
+        """
+        Kirim prompt bebas ke AI dan parse hasilnya sebagai JSON.
+        Digunakan oleh Composer, News Agent, dan Research Agent.
+        """
+        default = {"action": "HOLD", "confidence": 0.0, "reason": "AI unavailable"}
+        if not self._enabled:
+            return default
+
+        client = self._get_client()
+        if client is None:
+            return default
+
+        try:
+            response = client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": "Respond only in valid JSON format."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=0.3,
+            )
+            raw = response.choices[0].message.content.strip()
+            logger.debug(f"analyze_raw response: {raw[:200]}")
+            return self._parse_response(raw)
+        except Exception as e:
+            logger.error(f"analyze_raw error: {e}")
+            self._client = None
+            return default
+
     def _parse_response(self, raw: str) -> dict:
-        """Parse AI response JSON with extended action support."""
+        """Parse AI response JSON — mendukung 13 aksi total."""
         text = raw.strip()
         if text.startswith("```"):
             lines = text.split("\n")
@@ -355,7 +429,11 @@ class AIAgent:
         try:
             data = json.loads(text)
             action = data.get("action", "HOLD").upper()
-            valid_actions = ("BUY", "SELL", "HOLD", "CLOSE", "CLOSE_ALL", "MODIFY_SL_TP")
+            valid_actions = (
+                "BUY", "SELL", "HOLD", "CLOSE", "CLOSE_ALL", "MODIFY_SL_TP",
+                "SCAN_MARKET", "SELECT_SYMBOLS", "SET_SESSION_END",
+                "EARLY_TP", "END_DAY", "SCALE_IN", "SCALE_OUT",
+            )
             if action not in valid_actions:
                 action = "HOLD"
             confidence = float(data.get("confidence", 0.0))
@@ -364,7 +442,7 @@ class AIAgent:
 
             result = {"action": action, "confidence": confidence, "reason": reason}
 
-            # Optional fields for autonomous execution
+            # Original fields
             if "sl_points" in data:
                 result["sl_points"] = int(data["sl_points"])
             if "tp_points" in data:
@@ -377,6 +455,27 @@ class AIAgent:
                 result["new_sl"] = float(data["new_sl"])
             if "new_tp" in data:
                 result["new_tp"] = float(data["new_tp"])
+
+            # New self-configure fields
+            if "new_symbols" in data:
+                result["new_symbols"] = list(data["new_symbols"])
+            if "session_end" in data:
+                result["session_end"] = str(data["session_end"])
+            if "close_percent" in data:
+                result["close_percent"] = max(1, min(99, int(data["close_percent"])))
+            if "scale_volume" in data:
+                result["scale_volume"] = float(data["scale_volume"])
+            if "all" in data:
+                result["all"] = bool(data["all"])
+
+            # Extra fields for Composer / News / Research
+            for extra_key in ("sentiment", "key_events", "signal", "summary",
+                              "fundamental_outlook", "key_risks", "recommendation",
+                              "market_mode", "trading_focus", "adjusted_confidence",
+                              "adjusted_lot_multiplier", "dynamic_system_prompt",
+                              "agent_directives", "reasoning"):
+                if extra_key in data:
+                    result[extra_key] = data[extra_key]
 
             return result
         except (json.JSONDecodeError, ValueError, TypeError) as e:
