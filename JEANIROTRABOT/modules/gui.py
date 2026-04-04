@@ -23,6 +23,10 @@ from modules.trading_engine import TradingEngine
 from modules.risk_manager import RiskManager
 from modules.ai_agent import AIAgent, PROVIDERS, DEFAULT_SYSTEM_PROMPT
 from modules.chart import ChartManager
+from modules.news_agent import NewsAgent
+from modules.research_agent import ResearchAgent
+from modules.composer_agent import ComposerAgent, MARKET_MODES
+from modules.exchange_connector import ExchangeConnector, SUPPORTED_EXCHANGES
 
 logger = logging.getLogger("JEANIROTRABOT.gui")
 
@@ -49,6 +53,24 @@ class JeaniroTrabotApp:
         self.engine = TradingEngine(self.connector, self.risk, self.ai, self.config)
         self.chart_mgr = ChartManager()
 
+        # New agents
+        self.news_agent = NewsAgent()
+        self.research_agent = ResearchAgent()
+        self.composer = ComposerAgent(self.ai, self.config)
+        self.exchange_connector: Optional[ExchangeConnector] = None
+
+        # Inject agents ke engine
+        self.engine.set_composer(self.composer)
+        self.engine.set_news_agent(self.news_agent)
+        self.engine.set_research_agent(self.research_agent)
+
+        # Auto-enable AI jika API key tersedia (Fix F/L)
+        if self.config.get("AI_API_KEY"):
+            self.ai.enabled = True
+
+        # Composer mode change callback
+        self.composer.set_mode_change_callback(self._on_composer_mode_change)
+
         # GUI root
         self.root = ttkb.Window(
             title="JEANIROTRABOT - Robot Trading Otomatis",
@@ -63,6 +85,12 @@ class JeaniroTrabotApp:
 
         self._build_ui()
         self._start_refresh_timer()
+
+        # Auto-connect MT5 jika credentials tersimpan (Fix K)
+        if (self.config.get("MT5_SERVER") and
+                self.config.get("MT5_LOGIN") and
+                self.config.get("MT5_PASSWORD")):
+            self.root.after(500, self._auto_connect_on_startup)
 
     def run(self):
         self.root.mainloop()
@@ -216,6 +244,7 @@ class JeaniroTrabotApp:
             ent = ttkb.Entry(lf_risk, width=10)
             ent.grid(row=i, column=1, padx=5, pady=1)
             ent.insert(0, self.config.get(key, default))
+            ent.bind("<FocusOut>", lambda e: self._on_save_risk())  # Fix N: auto-save
             self.risk_entries[key] = ent
 
         btn_save_risk = ttkb.Button(
@@ -223,6 +252,52 @@ class JeaniroTrabotApp:
             command=self._on_save_risk
         )
         btn_save_risk.grid(row=len(risk_fields), column=0, columnspan=2, padx=5, pady=3, sticky=tk.EW)
+
+        # Exchange Connector (Crypto/Indonesia)
+        lf_exchange = ttkb.Labelframe(parent, text="Exchange Connector (Crypto)", bootstyle="secondary")
+        lf_exchange.pack(fill=tk.X, padx=5, pady=5)
+
+        ccxt_ok = ExchangeConnector.is_available()
+        ccxt_status = "ccxt OK" if ccxt_ok else "pip install ccxt"
+        ttkb.Label(lf_exchange, text=f"CCXT: {ccxt_status}",
+                   foreground=ACCENT_GREEN if ccxt_ok else "#888888",
+                   font=("Consolas", 8)).pack(anchor=tk.W, padx=5, pady=1)
+
+        ttkb.Label(lf_exchange, text="Exchange:").pack(anchor=tk.W, padx=5, pady=(3, 0))
+        exchange_names = list(SUPPORTED_EXCHANGES.keys())
+        self.cmb_exchange = ttkb.Combobox(
+            lf_exchange, values=exchange_names, state="readonly", width=24
+        )
+        self.cmb_exchange.pack(fill=tk.X, padx=5, pady=2)
+        saved_ex = self.config.get("CONNECTOR_TYPE", "MT5")
+        self.cmb_exchange.set(saved_ex if saved_ex in exchange_names else exchange_names[0])
+
+        ttkb.Label(lf_exchange, text="API Key:").pack(anchor=tk.W, padx=5, pady=(3, 0))
+        self.ent_ex_key = ttkb.Entry(lf_exchange, width=26, show="*")
+        self.ent_ex_key.pack(fill=tk.X, padx=5, pady=2)
+        self.ent_ex_key.insert(0, self.config.get("EXCHANGE_API_KEY", ""))
+
+        ttkb.Label(lf_exchange, text="API Secret:").pack(anchor=tk.W, padx=5, pady=(3, 0))
+        self.ent_ex_secret = ttkb.Entry(lf_exchange, width=26, show="*")
+        self.ent_ex_secret.pack(fill=tk.X, padx=5, pady=2)
+        self.ent_ex_secret.insert(0, self.config.get("EXCHANGE_API_SECRET", ""))
+
+        self.var_testnet = tk.BooleanVar(value=self.config.get("EXCHANGE_TESTNET", "false") == "true")
+        ttkb.Checkbutton(
+            lf_exchange, text="Testnet / Sandbox", variable=self.var_testnet,
+            bootstyle="warning-round-toggle"
+        ).pack(anchor=tk.W, padx=5, pady=2)
+
+        self.btn_connect_exchange = ttkb.Button(
+            lf_exchange, text="Connect Exchange",
+            bootstyle="info" if ccxt_ok else "secondary",
+            command=self._on_connect_exchange,
+            state=tk.NORMAL if ccxt_ok else tk.DISABLED,
+        )
+        self.btn_connect_exchange.pack(fill=tk.X, padx=5, pady=3)
+
+        self.lbl_exchange_status = ttkb.Label(lf_exchange, text="Disconnected", foreground=ACCENT_RED)
+        self.lbl_exchange_status.pack(padx=5, pady=2)
 
     # ── Center Panel (Chart) ──
 
@@ -310,7 +385,8 @@ class JeaniroTrabotApp:
         self.lbl_ai_status.pack(padx=5, pady=2)
 
         # Enable toggle
-        self.var_ai_enabled = tk.BooleanVar(value=False)
+        saved_key = self.config.get("AI_API_KEY", "")
+        self.var_ai_enabled = tk.BooleanVar(value=bool(saved_key))  # Fix L: auto-enable jika key ada
         ttkb.Checkbutton(
             lf_provider, text="Enable AI Agent", variable=self.var_ai_enabled,
             bootstyle="success-round-toggle", command=self._on_toggle_ai
@@ -346,6 +422,63 @@ class JeaniroTrabotApp:
             state=tk.DISABLED, wrap=tk.WORD
         )
         self.txt_ai_log.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        # ── Composer Agent Panel ──
+        lf_composer = ttkb.Labelframe(parent, text="Composer Agent (Meta-Orchestrator)", bootstyle="warning")
+        lf_composer.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Enable toggle
+        self.var_composer_enabled = tk.BooleanVar(
+            value=self.config.get("COMPOSER_ENABLED", "true") == "true"
+        )
+        ttkb.Checkbutton(
+            lf_composer, text="Enable Composer Agent", variable=self.var_composer_enabled,
+            bootstyle="warning-round-toggle", command=self._on_toggle_composer
+        ).pack(anchor=tk.W, padx=5, pady=3)
+
+        # Target profit + progress
+        target_frame = ttkb.Frame(lf_composer)
+        target_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttkb.Label(target_frame, text="Target Profit:").pack(side=tk.LEFT)
+        self.ent_profit_target = ttkb.Entry(target_frame, width=6)
+        self.ent_profit_target.pack(side=tk.LEFT, padx=3)
+        self.ent_profit_target.insert(0, self.config.get("PROFIT_TARGET_PERCENT", "70.0"))
+        ttkb.Label(target_frame, text="%").pack(side=tk.LEFT)
+
+        # Interval
+        interval_frame = ttkb.Frame(lf_composer)
+        interval_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttkb.Label(interval_frame, text="Interval (menit):").pack(side=tk.LEFT)
+        self.spn_composer_interval = ttkb.Spinbox(
+            interval_frame, from_=5, to=60, increment=5, width=5
+        )
+        self.spn_composer_interval.pack(side=tk.LEFT, padx=3)
+        self.spn_composer_interval.set(self.config.get("COMPOSER_INTERVAL", "10"))
+
+        ttkb.Button(
+            lf_composer, text="Save Composer Settings", bootstyle="warning-outline",
+            command=self._on_save_composer
+        ).pack(fill=tk.X, padx=5, pady=2)
+
+        ttkb.Button(
+            lf_composer, text="Force Composer Update", bootstyle="info-outline",
+            command=self._on_force_composer
+        ).pack(fill=tk.X, padx=5, pady=2)
+
+        # Mode display
+        self.lbl_composer_mode = ttkb.Label(
+            lf_composer, text="Mode: CONSERVATIVE", foreground="#00aaff",
+            font=("Consolas", 9, "bold")
+        )
+        self.lbl_composer_mode.pack(anchor=tk.W, padx=5, pady=2)
+
+        # Composer log
+        self.txt_composer_log = scrolledtext.ScrolledText(
+            lf_composer, height=5, bg=BG_DARK, fg="#ffcc88",
+            insertbackground="#ffffff", font=("Consolas", 8),
+            state=tk.DISABLED, wrap=tk.WORD
+        )
+        self.txt_composer_log.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
     def _update_key_hint(self):
         provider = self.cmb_provider.get()
@@ -401,9 +534,82 @@ class JeaniroTrabotApp:
         )
         self.txt_log.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
+        # News & Research tab
+        frame_news = ttkb.Frame(notebook)
+        notebook.add(frame_news, text="News & Research")
+        self._build_news_research_tab(frame_news)
+
+    def _build_news_research_tab(self, parent):
+        """Tab News Agent + Research Agent di bottom panel."""
+        pw = ttkb.Panedwindow(parent, orient=tk.HORIZONTAL)
+        pw.pack(fill=tk.BOTH, expand=True)
+
+        # News Agent side
+        lf_news = ttkb.Labelframe(pw, text="News Agent", bootstyle="info")
+        pw.add(lf_news, weight=1)
+
+        ctrl_news = ttkb.Frame(lf_news)
+        ctrl_news.pack(fill=tk.X, padx=3, pady=2)
+        self.var_news_enabled = tk.BooleanVar(
+            value=self.config.get("NEWS_AGENT_ENABLED", "false") == "true"
+        )
+        ttkb.Checkbutton(ctrl_news, text="Aktif", variable=self.var_news_enabled,
+                         bootstyle="info-round-toggle",
+                         command=self._on_toggle_news).pack(side=tk.LEFT, padx=3)
+        ttkb.Label(ctrl_news, text="Interval (menit):").pack(side=tk.LEFT, padx=3)
+        self.spn_news_interval = ttkb.Spinbox(ctrl_news, from_=5, to=120, increment=5, width=5)
+        self.spn_news_interval.pack(side=tk.LEFT)
+        self.spn_news_interval.set(self.config.get("NEWS_AGENT_INTERVAL", "30"))
+        ttkb.Button(ctrl_news, text="Fetch Now", bootstyle="info-outline",
+                    command=self._on_fetch_news).pack(side=tk.RIGHT, padx=3)
+
+        self.txt_news = scrolledtext.ScrolledText(
+            lf_news, height=5, bg=BG_DARK, fg="#aaddff",
+            insertbackground="#ffffff", font=("Consolas", 8),
+            state=tk.DISABLED, wrap=tk.WORD
+        )
+        self.txt_news.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        # Research Agent side
+        lf_research = ttkb.Labelframe(pw, text="DeepResearch Agent", bootstyle="warning")
+        pw.add(lf_research, weight=1)
+
+        ctrl_res = ttkb.Frame(lf_research)
+        ctrl_res.pack(fill=tk.X, padx=3, pady=2)
+        self.var_research_enabled = tk.BooleanVar(
+            value=self.config.get("RESEARCH_AGENT_ENABLED", "false") == "true"
+        )
+        ttkb.Checkbutton(ctrl_res, text="Aktif", variable=self.var_research_enabled,
+                         bootstyle="warning-round-toggle",
+                         command=self._on_toggle_research).pack(side=tk.LEFT, padx=3)
+        ttkb.Label(ctrl_res, text="Interval (menit):").pack(side=tk.LEFT, padx=3)
+        self.spn_research_interval = ttkb.Spinbox(ctrl_res, from_=15, to=240, increment=15, width=5)
+        self.spn_research_interval.pack(side=tk.LEFT)
+        self.spn_research_interval.set(self.config.get("RESEARCH_AGENT_INTERVAL", "60"))
+        ttkb.Button(ctrl_res, text="Analyze Now", bootstyle="warning-outline",
+                    command=self._on_run_research).pack(side=tk.RIGHT, padx=3)
+
+        self.txt_research = scrolledtext.ScrolledText(
+            lf_research, height=5, bg=BG_DARK, fg="#ffddaa",
+            insertbackground="#ffffff", font=("Consolas", 8),
+            state=tk.DISABLED, wrap=tk.WORD
+        )
+        self.txt_research.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
     # ──────────────────────────────────────────────
     # Event Handlers
     # ──────────────────────────────────────────────
+
+    def _auto_connect_on_startup(self):
+        """Auto-connect ke MT5 menggunakan credentials tersimpan (Fix K)."""
+        self._append_log("Auto-connecting ke MT5...")
+        self._on_connect()
+
+    def _auto_start_if_ready(self):
+        """Auto-start robot setelah connect jika semua setting tersedia (Fix M)."""
+        if not self.engine.running and self.connector.connected:
+            self._append_log("Auto-starting robot (settings tersimpan)...")
+            self._on_start_robot()
 
     def _on_connect(self):
         server = self.ent_server.get().strip()
@@ -449,12 +655,24 @@ class JeaniroTrabotApp:
                 elif symbols:
                     self.cmb_symbol.set(symbols[0])
             self._refresh_chart()
+
+            # Auto-start robot jika API key tersedia dan robot belum jalan (Fix M)
+            if self.config.get("AI_API_KEY") and not self.engine.running:
+                self.root.after(1000, self._auto_start_if_ready)
         else:
             self.lbl_conn_status.configure(text="Failed", foreground=ACCENT_RED)
             self._append_log(f"MT5 connection failed: {msg}")
             messagebox.showerror("Connection Error", msg)
 
     def _on_start_robot(self):
+        # Switch connector: gunakan exchange jika dipilih dan connected (Fix G)
+        connector_type = self.config.get("CONNECTOR_TYPE", "MT5")
+        if connector_type != "MT5" and self.exchange_connector and self.exchange_connector.connected:
+            self.engine.connector = self.exchange_connector
+            self._append_log(f"Engine menggunakan {connector_type} exchange connector")
+        else:
+            self.engine.connector = self.connector  # MT5 default
+
         # Parse multi-symbol list
         symbols_text = self.ent_symbols.get().strip()
         if symbols_text:
@@ -695,13 +913,192 @@ class JeaniroTrabotApp:
             self.txt_ai_log.insert(tk.END, line)
             self.txt_ai_log.see(tk.END)
             self.txt_ai_log.config(state=tk.DISABLED)
+        # Mirror Composer logs
+        if "[COMPOSER]" in msg or "Composer" in msg:
+            self._append_composer_log(msg.replace("[COMPOSER] ", ""))
 
     def _append_log_threadsafe(self, msg: str):
         self.root.after(0, lambda: self._append_log(msg))
+
+    # ── Exchange Connector handlers ──
+
+    def _on_connect_exchange(self):
+        exchange_name = self.cmb_exchange.get()
+        api_key = self.ent_ex_key.get().strip()
+        api_secret = self.ent_ex_secret.get().strip()
+        testnet = self.var_testnet.get()
+
+        self.config.set("CONNECTOR_TYPE", exchange_name)
+        self.config.set("EXCHANGE_API_KEY", api_key)
+        self.config.set("EXCHANGE_API_SECRET", api_secret)
+        self.config.set("EXCHANGE_TESTNET", str(testnet).lower())
+        self.config.save()
+
+        self.lbl_exchange_status.configure(text="Connecting...", foreground="#ffaa00")
+        self._append_log(f"Menghubungkan ke {exchange_name}...")
+
+        def do_connect():
+            conn = ExchangeConnector(exchange_name, api_key, api_secret, testnet)
+            ok, msg = conn.connect()
+            if ok:
+                self.exchange_connector = conn
+            self.root.after(0, lambda: self._handle_exchange_connect(ok, msg, conn))
+
+        threading.Thread(target=do_connect, daemon=True).start()
+
+    def _handle_exchange_connect(self, ok, msg, conn):
+        if ok:
+            self.lbl_exchange_status.configure(text="Connected", foreground=ACCENT_GREEN)
+            self._append_log(f"Exchange: {msg}")
+            # Swap connector di engine jika user mau
+            self._append_log("Exchange terhubung. Gunakan tombol 'Start Robot' untuk trading via exchange.")
+        else:
+            self.lbl_exchange_status.configure(text="Failed", foreground=ACCENT_RED)
+            self._append_log(f"Exchange failed: {msg}")
+
+    # ── News Agent handlers ──
+
+    def _on_toggle_news(self):
+        enabled = self.var_news_enabled.get()
+        interval = int(self.spn_news_interval.get())
+        self.config.set("NEWS_AGENT_ENABLED", str(enabled).lower())
+        self.config.set("NEWS_AGENT_INTERVAL", str(interval))
+        self.config.save()
+        self.news_agent.set_interval(interval)
+        self._append_log(f"News Agent {'AKTIF' if enabled else 'NONAKTIF'} (interval={interval} menit)")
+
+    def _on_fetch_news(self):
+        self._append_log("Mengambil berita pasar...")
+        symbols_text = self.ent_symbols.get().strip()
+        symbols = [s.strip() for s in symbols_text.replace(";", ",").split(",") if s.strip()]
+
+        def do_fetch():
+            news = self.news_agent.get_news(symbols, max_items=15)
+            self.root.after(0, lambda: self._display_news(news))
+
+        threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _display_news(self, news_items: list):
+        self.txt_news.config(state=tk.NORMAL)
+        self.txt_news.delete("1.0", tk.END)
+        if not news_items:
+            self.txt_news.insert(tk.END, "Tidak ada berita ditemukan.\n")
+        else:
+            for item in news_items:
+                rel = item.get("relevance", 0)
+                line = f"[{item.get('source','')}] {item.get('title','')}"
+                if rel > 2:
+                    line = "★ " + line
+                self.txt_news.insert(tk.END, line + "\n")
+                if item.get("summary"):
+                    self.txt_news.insert(tk.END, f"  {item['summary'][:100]}\n\n")
+        self.txt_news.config(state=tk.DISABLED)
+        self._append_log(f"News Agent: {len(news_items)} berita diambil.")
+
+    # ── Research Agent handlers ──
+
+    def _on_toggle_research(self):
+        enabled = self.var_research_enabled.get()
+        interval = int(self.spn_research_interval.get())
+        self.config.set("RESEARCH_AGENT_ENABLED", str(enabled).lower())
+        self.config.set("RESEARCH_AGENT_INTERVAL", str(interval))
+        self.config.save()
+        self.research_agent.set_interval(interval)
+        self._append_log(f"Research Agent {'AKTIF' if enabled else 'NONAKTIF'} (interval={interval} menit)")
+
+    def _on_run_research(self):
+        if not self.ai.enabled:
+            from tkinter import messagebox
+            messagebox.showwarning("Research Agent", "Aktifkan AI Agent terlebih dahulu.")
+            return
+        self._append_log("Menjalankan DeepResearch Agent...")
+
+        symbols_text = self.ent_symbols.get().strip()
+        symbols = [s.strip() for s in symbols_text.replace(";", ",").split(",") if s.strip()]
+
+        def do_research():
+            report = self.research_agent.run_full_research(symbols[:5], self.ai)
+            self.root.after(0, lambda: self._display_research(report))
+
+        threading.Thread(target=do_research, daemon=True).start()
+
+    def _display_research(self, report: dict):
+        self.txt_research.config(state=tk.NORMAL)
+        self.txt_research.delete("1.0", tk.END)
+
+        fg = report.get("fear_greed", {})
+        if fg.get("available"):
+            self.txt_research.insert(tk.END,
+                f"Fear & Greed Index: {fg['value']}/100 — {fg['label']}\n\n")
+
+        calendar = report.get("calendar", [])
+        if calendar:
+            self.txt_research.insert(tk.END, f"Economic Events ({len(calendar)} high/medium):\n")
+            for ev in calendar[:5]:
+                self.txt_research.insert(tk.END,
+                    f"  [{ev['country']}] {ev['title']} — {ev.get('date','?')}\n")
+            self.txt_research.insert(tk.END, "\n")
+
+        for sym, rep in report.get("symbol_reports", {}).items():
+            rec = rep.get("recommendation", "?")
+            outlook = rep.get("fundamental_outlook", "")[:100]
+            self.txt_research.insert(tk.END, f"{sym} [{rec}]: {outlook}\n")
+
+        self.txt_research.config(state=tk.DISABLED)
+        self._append_log("Research Agent selesai.")
+
+    # ── Composer Agent handlers ──
+
+    def _on_toggle_composer(self):
+        enabled = self.var_composer_enabled.get()
+        self.config.set("COMPOSER_ENABLED", str(enabled).lower())
+        self.config.save()
+        self._append_log(f"Composer Agent {'AKTIF' if enabled else 'NONAKTIF'}")
+
+    def _on_save_composer(self):
+        try:
+            target = float(self.ent_profit_target.get())
+            interval = int(self.spn_composer_interval.get())
+        except ValueError:
+            return
+        self.config.set("PROFIT_TARGET_PERCENT", str(target))
+        self.config.set("COMPOSER_INTERVAL", str(interval))
+        self.config.save()
+        self.composer._profit_target = target
+        self.composer._interval_minutes = interval
+        self._append_log(f"Composer: target={target}%, interval={interval} menit disimpan.")
+
+    def _on_force_composer(self):
+        if not self.ai.enabled:
+            from tkinter import messagebox
+            messagebox.showwarning("Composer", "Aktifkan AI Agent terlebih dahulu.")
+            return
+        self._append_log("Force Composer update...")
+        self.composer._last_run = 0  # Reset timer supaya langsung jalan
+
+    def _on_composer_mode_change(self, mode: str, mode_params: dict):
+        """Callback saat Composer berganti mode."""
+        color = mode_params.get("color", "#ffffff")
+        desc = mode_params.get("description", "")
+        self.root.after(0, lambda: self._update_composer_display(mode, color, desc))
+
+    def _update_composer_display(self, mode: str, color: str, desc: str):
+        self.lbl_composer_mode.configure(text=f"Mode: {mode}", foreground=color)
+        self._append_composer_log(f"Mode → {mode}: {desc}")
+
+    def _append_composer_log(self, msg: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] {msg}\n"
+        self.txt_composer_log.config(state=tk.NORMAL)
+        self.txt_composer_log.insert(tk.END, line)
+        self.txt_composer_log.see(tk.END)
+        self.txt_composer_log.config(state=tk.DISABLED)
 
     def _on_close(self):
         if self.engine.running:
             self.engine.stop()
         self.connector.disconnect()
+        if self.exchange_connector and self.exchange_connector.connected:
+            self.exchange_connector.disconnect()
         self.chart_mgr.clear()
         self.root.destroy()

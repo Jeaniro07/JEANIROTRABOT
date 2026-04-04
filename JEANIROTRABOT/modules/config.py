@@ -41,7 +41,7 @@ DEFAULTS = {
     "DEFAULT_SL_POINTS": "100",
     "DEFAULT_TP_POINTS": "200",
     # Autonomous trading settings
-    "TRADE_SYMBOLS": "EURUSD",
+    "TRADE_SYMBOLS": "EURUSD,XAUUSD,BTCUSD,ETHUSD,GBPUSD",  # Mix forex+metals+crypto
     "AI_AUTONOMY_LEVEL": "full",
     "MAX_POSITIONS_TOTAL": "5",
     "MAX_POSITIONS_PER_SYMBOL": "1",
@@ -49,6 +49,28 @@ DEFAULTS = {
     "TRAILING_STOP_POINTS": "0",
     "POSITION_REVIEW_ENABLED": "true",
     "AI_AUTO_EXECUTE": "true",
+    # Self-configuring trading (new)
+    "AI_MARKET_SCAN_ENABLED": "true",
+    "AI_SESSION_END_TIME": "",        # HH:MM — kosong = tidak ada batas
+    "AI_TRADING_ENDED_TODAY": "false",
+    "AUTO_DISCOVER_SYMBOLS": "true",  # Auto-scan simbol dari connector
+    "MAX_AUTO_SYMBOLS": "10",         # Max simbol auto-discovered
+    # Exchange connector (new)
+    "CONNECTOR_TYPE": "MT5",          # MT5 | Binance | OKX | Indodax | Tokocrypto
+    "EXCHANGE_API_KEY": "",
+    "EXCHANGE_API_SECRET": "",
+    "EXCHANGE_TESTNET": "false",
+    # News Agent (new)
+    "NEWS_AGENT_ENABLED": "false",
+    "NEWS_AGENT_INTERVAL": "30",      # menit
+    # Research Agent (new)
+    "RESEARCH_AGENT_ENABLED": "false",
+    "RESEARCH_AGENT_INTERVAL": "60",  # menit
+    # Composer Agent (new)
+    "COMPOSER_ENABLED": "true",
+    "COMPOSER_INTERVAL": "5",          # menit (Fix E: 10 → 5)
+    "PROFIT_TARGET_PERCENT": "70.0",
+    "INITIAL_BALANCE_SNAPSHOT": "",
 }
 
 
