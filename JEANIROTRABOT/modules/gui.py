@@ -455,6 +455,15 @@ class JeaniroTrabotApp:
         self.spn_composer_interval.pack(side=tk.LEFT, padx=3)
         self.spn_composer_interval.set(self.config.get("COMPOSER_INTERVAL", "10"))
 
+        # Profit gauge canvas
+        gauge_frame = ttkb.Frame(lf_composer)
+        gauge_frame.pack(fill=tk.X, padx=5, pady=3)
+        ttkb.Label(gauge_frame, text="Progress:").pack(side=tk.LEFT)
+        self.gauge_canvas = tk.Canvas(gauge_frame, height=20, bg="#1a1a2e",
+                                      highlightthickness=1,
+                                      highlightbackground="#333333")
+        self.gauge_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
         ttkb.Button(
             lf_composer, text="Save Composer Settings", bootstyle="warning-outline",
             command=self._on_save_composer
@@ -465,12 +474,23 @@ class JeaniroTrabotApp:
             command=self._on_force_composer
         ).pack(fill=tk.X, padx=5, pady=2)
 
-        # Mode display
+        # Mode display + badge
+        badge_row = ttkb.Frame(lf_composer)
+        badge_row.pack(fill=tk.X, padx=5, pady=2)
         self.lbl_composer_mode = ttkb.Label(
-            lf_composer, text="Mode: CONSERVATIVE", foreground="#00aaff",
+            badge_row, text="Mode: CONSERVATIVE", foreground="#00aaff",
             font=("Consolas", 9, "bold")
         )
-        self.lbl_composer_mode.pack(anchor=tk.W, padx=5, pady=2)
+        self.lbl_composer_mode.pack(side=tk.LEFT)
+        self.badge_composer = tk.Canvas(badge_row, width=14, height=14,
+                                        bg="#1a1a2e", highlightthickness=0)
+        self.badge_composer.pack(side=tk.LEFT, padx=6)
+        oval = self.badge_composer.create_oval(2, 2, 12, 12, fill="#00ff88", outline="")
+        self.badge_composer._badge_oval = oval
+        self.lbl_composer_spinner = tk.Label(badge_row, text="", bg="#1a1a2e",
+                                             fg="#ffaa00", font=("Consolas", 10))
+        self.lbl_composer_spinner.pack(side=tk.LEFT)
+        self.badge_composer._spinner_lbl = self.lbl_composer_spinner
 
         # Composer log
         self.txt_composer_log = scrolledtext.ScrolledText(
