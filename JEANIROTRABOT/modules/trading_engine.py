@@ -145,6 +145,9 @@ class TradingEngine:
         if not self.connector.connected:
             return False, "Not connected to MT5/Exchange."
 
+        # Re-activate risk manager — bisa saja deactivated dari sesi sebelumnya
+        self.risk.activate()
+
         account = self.connector.get_account_info()
         if account:
             self.risk.set_initial_equity(account.equity)
@@ -230,9 +233,10 @@ class TradingEngine:
     # ── Background agent threads (Fix A) ──
 
     def _start_background_agents(self):
-        """Start Composer/News/Research sebagai background daemon threads."""
+        """Start Composer/News/Research/MarketScanner sebagai background daemon threads."""
         self._agent_threads = []
-        for target in [self._composer_loop, self._news_loop, self._research_loop]:
+        for target in [self._composer_loop, self._news_loop,
+                       self._research_loop, self._market_scanner_loop]:
             t = threading.Thread(target=target, daemon=True)
             t.start()
             self._agent_threads.append(t)
@@ -268,6 +272,78 @@ class TradingEngine:
             except Exception as e:
                 logger.error(f"Research bg error: {e}")
             self._stop_event.wait(timeout=120)
+
+    def _market_scanner_loop(self):
+        """Agent khusus scan pasar secara otomatis dan periodik — tidak bergantung AI action.
+        Refresh symbol cache + pilih simbol terbaik setiap MARKET_SCAN_INTERVAL menit."""
+        scan_interval = self.config.get_int("MARKET_SCAN_INTERVAL", 30) * 60  # detik
+        self._log("Market Scanner Agent dimulai — akan scan otomatis setiap "
+                  f"{scan_interval // 60} menit")
+
+        # Tunggu sebentar agar connector stabil
+        self._stop_event.wait(timeout=5)
+
+        while not self._stop_event.is_set():
+            try:
+                self._run_market_scan()
+            except Exception as e:
+                logger.error(f"Market scanner error: {e}")
+            self._stop_event.wait(timeout=scan_interval)
+
+    def _run_market_scan(self):
+        """Eksekusi satu siklus scan pasar: refresh cache → filter → pilih simbol."""
+        if self._stop_event.is_set():
+            return
+
+        self._log("Market Scanner: memulai scan pasar otomatis...")
+
+        # Step 1: Refresh cache dari connector
+        self._refresh_symbols_cache()
+        if not self._available_symbols_cache:
+            self._log("Market Scanner: tidak ada simbol dari connector, skip.")
+            return
+
+        # Step 2: Filter simbol yang aktif (ada harga)
+        active_syms = self._filter_active_symbols(self._available_symbols_cache[:60])
+        if not active_syms:
+            self._log("Market Scanner: tidak ada simbol aktif, gunakan list saat ini.")
+            return
+
+        self._log(f"Market Scanner: {len(active_syms)} simbol aktif ditemukan")
+
+        # Step 3: Pilih simbol — via AI jika aktif, fallback ke auto-mix
+        max_count = self.config.get_int("MAX_AUTO_SYMBOLS", 10)
+        if self.ai.enabled:
+            self._request_symbol_selection(active_syms[:30])
+        else:
+            self._auto_select_symbol_mix(active_syms, max_count)
+            self._log(f"Market Scanner: simbol dipilih (non-AI): {', '.join(self._symbols)}")
+
+    def _filter_active_symbols(self, symbols: list) -> list:
+        """Filter simbol yang memiliki harga aktif — cek batch kecil saja agar cepat."""
+        PRIORITY = ["XAUUSD", "EURUSD", "GBPUSD", "BTCUSD", "ETHUSD",
+                    "USDJPY", "AUDUSD", "USDCAD", "BTCUSDT", "ETHUSDT",
+                    "XAGUSD", "USOIL", "USDCHF", "EURGBP", "NZDUSD"]
+
+        # Letakkan priority symbols di depan
+        priority_first = [s for s in PRIORITY if s in symbols]
+        rest = [s for s in symbols if s not in priority_first]
+        ordered = priority_first + rest
+
+        active = []
+        checked = 0
+        for sym in ordered:
+            if checked >= 40 or self._stop_event.is_set():
+                break
+            try:
+                tick = self.connector.get_tick(sym)
+                if tick and tick.get("ask", 0) > 0:
+                    active.append(sym)
+            except Exception:
+                pass
+            checked += 1
+
+        return active
 
     # ── Periodic agent runners ──
 
@@ -363,9 +439,11 @@ class TradingEngine:
         self._session_end_time = None
         self._daily_pnl = 0.0
         self._trade_count_today = 0
+        # Re-activate risk manager setiap hari baru (drawdown reset per hari)
+        self.risk.activate()
         if self._composer:
             self._composer.reset_daily_stats()
-        self._log("State harian direset untuk hari baru.")
+        self._log("State harian direset untuk hari baru — Risk Manager aktif kembali.")
 
     def _get_scannable_symbols(self, max_symbols: int = 20) -> list[str]:
         """Ambil daftar simbol dari cache (Fix I) — tidak blocking."""
@@ -453,27 +531,46 @@ class TradingEngine:
             self._log(f"Auto-selected symbols: {', '.join(selected)}")
 
     def _request_symbol_selection(self, available_symbols: list[str]):
-        """Kirim daftar simbol ke AI untuk dipilih, proses SELECT_SYMBOLS response."""
-        if not self.ai.enabled or not available_symbols:
+        """Kirim daftar simbol ke AI untuk dipilih. Fallback ke auto-mix jika AI tidak aktif."""
+        if not available_symbols:
             return
+
+        # Fallback non-AI: auto-mix langsung
+        if not self.ai.enabled:
+            max_count = self.config.get_int("MAX_AUTO_SYMBOLS", 10)
+            self._auto_select_symbol_mix(available_symbols, max_count)
+            return
+
         try:
+            max_count = self.config.get_int("MAX_AUTO_SYMBOLS", 10)
             prompt = (
-                f"=== SCAN MARKET ===\n"
-                f"Simbol tersedia ({len(available_symbols)}): {', '.join(available_symbols[:30])}\n\n"
+                f"=== MARKET SCANNER AGENT ===\n"
+                f"Simbol tersedia dari broker ({len(available_symbols)}): "
+                f"{', '.join(available_symbols[:30])}\n\n"
                 f"Simbol aktif saat ini: {', '.join(self._symbols)}\n\n"
-                f"Berdasarkan kondisi pasar saat ini, pilih 2-5 simbol terbaik untuk trading hari ini. "
-                f"Prioritaskan simbol dengan volatilitas cukup dan spread rendah.\n\n"
-                f"Respond JSON: {{\"action\": \"SELECT_SYMBOLS\", \"new_symbols\": [\"SYM1\",\"SYM2\"], "
-                f"\"confidence\": 0.8, \"reason\": \"penjelasan\"}}"
+                f"Tugas: Pilih {min(max_count, 5)} simbol terbaik untuk trading sekarang. "
+                f"Pertimbangkan: volatilitas, spread, sesi trading aktif, likuiditas. "
+                f"Sertakan campuran forex + metals + crypto jika tersedia.\n\n"
+                f"Respond HANYA JSON: {{\"action\": \"SELECT_SYMBOLS\", "
+                f"\"new_symbols\": [\"SYM1\",\"SYM2\"], "
+                f"\"confidence\": 0.8, \"reason\": \"penjelasan singkat\"}}"
             )
             result = self.ai.analyze_raw(prompt)
             if result.get("action") == "SELECT_SYMBOLS":
                 new_syms = result.get("new_symbols", [])
                 if new_syms:
-                    self._symbols = new_syms
-                    self._log(f"AI memilih simbol baru: {', '.join(new_syms)}")
+                    self._symbols = [s.strip().upper() for s in new_syms if s.strip()]
+                    self._log(f"Market Scanner AI pilih: {', '.join(self._symbols)} "
+                              f"— {result.get('reason', '')[:80]}")
+            else:
+                # AI tidak merespons SELECT_SYMBOLS — fallback ke auto-mix
+                self._auto_select_symbol_mix(available_symbols,
+                                             self.config.get_int("MAX_AUTO_SYMBOLS", 10))
         except Exception as e:
             logger.error(f"_request_symbol_selection error: {e}")
+            # Fallback ke auto-mix jika AI error
+            self._auto_select_symbol_mix(available_symbols,
+                                         self.config.get_int("MAX_AUTO_SYMBOLS", 10))
 
     def _scale_in_position(self, ticket, scale_volume: float):
         """Tambah volume ke posisi existing (buka order baru searah)."""

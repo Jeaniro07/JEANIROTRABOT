@@ -55,6 +55,7 @@ DEFAULTS = {
     "AI_TRADING_ENDED_TODAY": "false",
     "AUTO_DISCOVER_SYMBOLS": "true",  # Auto-scan simbol dari connector
     "MAX_AUTO_SYMBOLS": "10",         # Max simbol auto-discovered
+    "MARKET_SCAN_INTERVAL": "30",     # Interval scan pasar otomatis (menit)
     # Exchange connector (new)
     "CONNECTOR_TYPE": "MT5",          # MT5 | Binance | OKX | Indodax | Tokocrypto
     "EXCHANGE_API_KEY": "",
