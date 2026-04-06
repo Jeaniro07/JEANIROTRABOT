@@ -292,6 +292,7 @@ class AIAgent:
         free_margin: float = 0.0, open_positions: list = None,
         spread: float = 0.0, risk_status: dict = None,
         symbol_info: dict = None,
+        system_prompt_override: str = None,
     ) -> dict:
         """Send full market context to AI and get autonomous trading decision."""
         default = {"action": "HOLD", "confidence": 0.0,
@@ -305,6 +306,9 @@ class AIAgent:
         if client is None:
             default["reason"] = "No API client available."
             return default
+
+        # Use override prompt if provided (thread-safe: no shared state mutation)
+        effective_system_prompt = system_prompt_override or self._system_prompt
 
         # Build comprehensive context
         user_prompt = (
@@ -368,11 +372,12 @@ class AIAgent:
             response = client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {"role": "system", "content": self._system_prompt},
+                    {"role": "system", "content": effective_system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=500,
+                max_tokens=200,
                 temperature=0.3,
+                timeout=15,
             )
             raw = response.choices[0].message.content.strip()
             logger.info(f"AI [{self._provider}/{self._model}]: {raw}")
@@ -409,6 +414,7 @@ class AIAgent:
                 ],
                 max_tokens=max_tokens,
                 temperature=0.3,
+                timeout=30,
             )
             raw = response.choices[0].message.content.strip()
             logger.debug(f"analyze_raw response: {raw[:200]}")

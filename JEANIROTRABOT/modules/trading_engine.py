@@ -8,6 +8,7 @@ Composer Agent mengendalikan semua agent lain secara adaptif.
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -655,21 +656,31 @@ class TradingEngine:
         risk_status = self.risk.get_status(account.equity)
         total_positions = len(all_positions)
 
-        # 2. Scan each symbol
-        for symbol in self._symbols:
+        # 2. Scan each symbol — run in parallel (max 4 threads) for fast cycle time
+        symbols_snapshot = list(self._symbols)
+        if self._stop_event.is_set():
+            return
+
+        def _process_safe(sym):
             if self._stop_event.is_set():
-                break
+                return
             try:
                 self._process_symbol(
-                    symbol=symbol,
+                    symbol=sym,
                     account=account,
                     all_positions=all_positions,
                     risk_status=risk_status,
                     total_positions=total_positions,
                 )
             except Exception as e:
-                self._log(f"Error processing {symbol}: {e}")
-                logger.exception(f"Symbol processing error: {symbol}")
+                self._log(f"Error processing {sym}: {e}")
+                logger.exception(f"Symbol processing error: {sym}")
+
+        max_workers = min(4, len(symbols_snapshot)) if symbols_snapshot else 1
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="sym") as ex:
+            futures = {ex.submit(_process_safe, s): s for s in symbols_snapshot}
+            for fut in as_completed(futures):
+                pass  # errors already handled inside _process_safe
 
         # 3. Position review phase (check all open positions across all symbols)
         if self.config.get("POSITION_REVIEW_ENABLED", "true").lower() == "true":
@@ -709,13 +720,11 @@ class TradingEngine:
         # Determine signal
         if self.ai.enabled:
             spread = symbol_info.get("spread", 0) if symbol_info else 0
-            ohlcv_summary = df.tail(10).to_string()
+            # Compact 5-row OHLCV — saves ~200 tokens vs df.tail(10).to_string()
+            tail = df.tail(5)[["Open", "High", "Low", "Close", "Volume"]]
+            ohlcv_summary = tail.to_csv(index=False, float_format="%.5f")
 
-            # Inject Composer's dynamic prompt jika ada
-            original_prompt = self.ai.system_prompt
-            if self._composer_dynamic_prompt:
-                self.ai.system_prompt = self._composer_dynamic_prompt
-
+            # Inject Composer's dynamic prompt jika ada (thread-safe via override param)
             result = self.ai.analyze(
                 symbol=symbol,
                 timeframe=self._timeframe,
@@ -729,10 +738,8 @@ class TradingEngine:
                 spread=spread,
                 risk_status=risk_status,
                 symbol_info=symbol_info,
+                system_prompt_override=self._composer_dynamic_prompt or None,
             )
-            # Restore prompt asli
-            if self._composer_dynamic_prompt:
-                self.ai.system_prompt = original_prompt
 
             self._log(
                 f"AI [{symbol}]: {result['action']} (conf={result['confidence']:.2f}) "
