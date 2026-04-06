@@ -101,6 +101,14 @@ class TradingEngine:
         self._available_symbols_cache: list = []
         self._agent_threads: list = []
 
+        # Per-symbol cooldown — END_DAY tidak blokir semua trading global
+        # key: symbol, value: timestamp cooldown berakhir
+        self._symbol_cooldowns: dict = {}
+        self._END_DAY_COOLDOWN_SEC: int = 1800  # 30 menit cooldown per simbol
+
+        # Track berapa simbol aktif per cycle (market-closed detection)
+        self._last_active_symbols: int = 0
+
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
@@ -203,23 +211,34 @@ class TradingEngine:
                     self._reset_daily_state()
                     self._last_date = today
 
-                # Cek batas waktu sesi yang diset AI
+                # Cek batas waktu sesi yang diset AI (SET_SESSION_END)
                 if self._session_end_time:
                     now_str = datetime.now().strftime("%H:%M")
                     if now_str >= self._session_end_time:
-                        self._log(f"Sesi trading berakhir (AI set {self._session_end_time}). Menunggu hari berikutnya.")
+                        self._log(f"Sesi trading berakhir (AI set {self._session_end_time}). "
+                                  f"Menunggu hari berikutnya.")
                         self._trading_ended_today = True
                         self._session_end_time = None
 
-                # Skip jika trading sudah diakhiri hari ini
+                # _trading_ended_today hanya berlaku untuk SET_SESSION_END bukan END_DAY
+                # END_DAY sekarang menggunakan per-symbol cooldown
                 if self._trading_ended_today:
-                    if self._stop_event.wait(timeout=60):
+                    # Tunggu hingga hari berikutnya — check setiap 5 menit
+                    if self._stop_event.wait(timeout=300):
                         break
                     continue
 
-                # Composer/News/Research berjalan di background threads (Fix A)
+                # Market-closed detection: jika 0 simbol aktif 3 cycle berturut
+                # tingkatkan interval ke 60 detik agar tidak spam log
+                wait_time = self._interval
+                if self._last_active_symbols == 0:
+                    wait_time = 60
+                    self._log("Pasar tampak tertutup — menunggu 60 detik sebelum cycle berikutnya")
+
+                # Jalankan cycle utama
                 self._cycle()
                 consecutive_errors = 0
+
             except Exception as e:
                 consecutive_errors += 1
                 self._log(f"Engine error: {e}")
@@ -228,7 +247,8 @@ class TradingEngine:
                 if self._stop_event.wait(timeout=backoff):
                     break
                 continue
-            if self._stop_event.wait(timeout=self._interval):
+
+            if self._stop_event.wait(timeout=wait_time):
                 break
 
     # ── Background agent threads (Fix A) ──
@@ -440,11 +460,32 @@ class TradingEngine:
         self._session_end_time = None
         self._daily_pnl = 0.0
         self._trade_count_today = 0
+        # Bersihkan semua per-symbol cooldown (END_DAY dari hari sebelumnya)
+        self._symbol_cooldowns.clear()
+        self._last_active_symbols = 0
         # Re-activate risk manager setiap hari baru (drawdown reset per hari)
         self.risk.activate()
         if self._composer:
             self._composer.reset_daily_stats()
         self._log("State harian direset untuk hari baru — Risk Manager aktif kembali.")
+
+    def _update_market_summary(self, account, all_positions: list, risk_status: dict):
+        """Update _market_summary setelah setiap cycle — digunakan oleh Composer."""
+        try:
+            sym_list = ", ".join(self._symbols[:5])
+            pos_count = len(all_positions)
+            equity = account.equity if account else 0
+            dd = risk_status.get("drawdown_pct", 0) if risk_status else 0
+            pnl_today = self._daily_pnl
+            cooldown_syms = list(self._symbol_cooldowns.keys())
+            cooldown_str = f" | Cooldown: {', '.join(cooldown_syms)}" if cooldown_syms else ""
+            self._market_summary = (
+                f"Simbol aktif: {sym_list} | Open positions: {pos_count} | "
+                f"Equity: {equity:.2f} | DD: {dd:.2f}% | "
+                f"P&L hari ini: {pnl_today:.2f}{cooldown_str}"
+            )
+        except Exception as e:
+            logger.debug(f"market_summary update error: {e}")
 
     def _get_scannable_symbols(self, max_symbols: int = 20) -> list[str]:
         """Ambil daftar simbol dari cache (Fix I) — tidak blocking."""
@@ -661,38 +702,64 @@ class TradingEngine:
         if self._stop_event.is_set():
             return
 
+        # Skip simbol yang sedang dalam END_DAY cooldown
+        now_ts = time.time()
+        expired = [s for s, exp in self._symbol_cooldowns.items() if now_ts >= exp]
+        for s in expired:
+            del self._symbol_cooldowns[s]
+            self._log(f"END_DAY cooldown selesai untuk {s} — siap trading kembali")
+
+        active_symbols = [s for s in symbols_snapshot if s not in self._symbol_cooldowns]
+
+        # Track berapa simbol aktif (untuk market-closed detection)
+        symbols_with_tick = []
+
         def _process_safe(sym):
             if self._stop_event.is_set():
                 return
             try:
-                self._process_symbol(
+                had_data = self._process_symbol(
                     symbol=sym,
                     account=account,
                     all_positions=all_positions,
                     risk_status=risk_status,
                     total_positions=total_positions,
                 )
+                if had_data:
+                    symbols_with_tick.append(sym)
             except Exception as e:
                 self._log(f"Error processing {sym}: {e}")
                 logger.exception(f"Symbol processing error: {sym}")
 
-        max_workers = min(4, len(symbols_snapshot)) if symbols_snapshot else 1
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="sym") as ex:
-            futures = {ex.submit(_process_safe, s): s for s in symbols_snapshot}
-            for fut in as_completed(futures):
-                pass  # errors already handled inside _process_safe
+        if active_symbols:
+            max_workers = min(4, len(active_symbols))
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="sym") as ex:
+                futures = {ex.submit(_process_safe, s): s for s in active_symbols}
+                for fut in as_completed(futures):
+                    pass  # errors already handled inside _process_safe
+        elif symbols_snapshot:
+            # Semua simbol dalam cooldown — log ringkas
+            cooling = list(self._symbol_cooldowns.keys())
+            self._log(f"Semua simbol dalam END_DAY cooldown: {', '.join(cooling[:5])}")
+
+        # Update active symbol counter (market-closed detection)
+        self._last_active_symbols = len(symbols_with_tick)
+
+        # Update market summary untuk Composer — setelah semua simbol diproses
+        self._update_market_summary(account, all_positions, risk_status)
 
         # 3. Position review phase (check all open positions across all symbols)
         if self.config.get("POSITION_REVIEW_ENABLED", "true").lower() == "true":
             self._review_positions(account, all_positions, risk_status)
 
     def _process_symbol(self, symbol: str, account, all_positions: list,
-                        risk_status: dict, total_positions: int):
-        """Process a single symbol: fetch data → AI analysis → execute."""
+                        risk_status: dict, total_positions: int) -> bool:
+        """Process a single symbol: fetch data → AI analysis → execute.
+        Returns True jika simbol memiliki data valid (market terbuka)."""
         # Fetch OHLCV
         df = self.connector.get_ohlcv(symbol, self._timeframe, count=100)
         if df is None or len(df) < 50:
-            return
+            return False
 
         # Compute indicators
         df["SMA20"] = compute_sma(df["Close"], 20)
@@ -705,11 +772,11 @@ class TradingEngine:
         rsi = latest["RSI"]
 
         if pd.isna(sma20) or pd.isna(sma50) or pd.isna(rsi):
-            return
+            return False
 
         tick = self.connector.get_tick(symbol)
         if not tick:
-            return
+            return False
 
         # Get symbol info
         symbol_info = self.connector.get_symbol_info(symbol)
@@ -753,6 +820,8 @@ class TradingEngine:
             if signal in ("BUY", "SELL"):
                 self._execute_basic_signal(signal, symbol, total_positions,
                                            len(symbol_positions))
+
+        return True  # Simbol punya data valid (market terbuka)
 
     def _execute_ai_decision(self, result: dict, symbol: str, symbol_info: dict,
                               total_positions: int, symbol_pos_count: int):
@@ -893,8 +962,11 @@ class TradingEngine:
                 self._log("EARLY_TP: tidak ada ticket atau all=true, skip.")
 
         elif action == "END_DAY":
-            self._trading_ended_today = True
-            self._log(f"AI END_DAY: tidak ada peluang pasar. Trading dihentikan untuk hari ini. [{symbol}]")
+            # Per-symbol cooldown 30 menit — tidak blokir simbol lain
+            expires = time.time() + self._END_DAY_COOLDOWN_SEC
+            self._symbol_cooldowns[symbol] = expires
+            self._log(f"AI END_DAY [{symbol}]: tidak ada peluang, cooldown 30 menit. "
+                      f"Simbol lain tetap aktif.")
 
         elif action == "SCALE_IN":
             ticket = result.get("ticket")
