@@ -23,6 +23,8 @@ from modules.trading_engine import TradingEngine
 from modules.risk_manager import RiskManager
 from modules.ai_agent import AIAgent, PROVIDERS, DEFAULT_SYSTEM_PROMPT
 from modules.chart import ChartManager
+from modules.specialist_agents import AgentSignal
+from modules.composer_agent import FinalDecision
 
 logger = logging.getLogger("JEANIROTRABOT.gui")
 
@@ -58,8 +60,9 @@ class JeaniroTrabotApp:
         )
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Set log callback from engine
+        # Set callbacks from engine
         self.engine.set_log_callback(self._append_log_threadsafe)
+        self.engine.set_signal_callback(self._update_agent_panel_threadsafe)
 
         self._build_ui()
         self._start_refresh_timer()
@@ -236,6 +239,8 @@ class JeaniroTrabotApp:
         self.var_sma20 = tk.BooleanVar(value=True)
         self.var_sma50 = tk.BooleanVar(value=True)
         self.var_rsi = tk.BooleanVar(value=True)
+        self.var_macd = tk.BooleanVar(value=True)
+        self.var_bb = tk.BooleanVar(value=True)
 
         ttkb.Checkbutton(ctrl, text="SMA 20", variable=self.var_sma20,
                          bootstyle="info-round-toggle",
@@ -245,6 +250,12 @@ class JeaniroTrabotApp:
                          command=self._refresh_chart).pack(side=tk.LEFT, padx=5)
         ttkb.Checkbutton(ctrl, text="RSI (14)", variable=self.var_rsi,
                          bootstyle="secondary-round-toggle",
+                         command=self._refresh_chart).pack(side=tk.LEFT, padx=5)
+        ttkb.Checkbutton(ctrl, text="MACD", variable=self.var_macd,
+                         bootstyle="primary-round-toggle",
+                         command=self._refresh_chart).pack(side=tk.LEFT, padx=5)
+        ttkb.Checkbutton(ctrl, text="BB", variable=self.var_bb,
+                         bootstyle="danger-round-toggle",
                          command=self._refresh_chart).pack(side=tk.LEFT, padx=5)
 
         ttkb.Button(ctrl, text="Refresh", bootstyle="info-outline",
@@ -346,6 +357,105 @@ class JeaniroTrabotApp:
             state=tk.DISABLED, wrap=tk.WORD
         )
         self.txt_ai_log.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        # ── Agent Signals Panel ──
+        self._build_agent_panel(parent)
+
+    def _build_agent_panel(self, parent):
+        """Build the multi-agent signals display panel."""
+        lf = ttkb.Labelframe(parent, text="🤖 Agent Signals", bootstyle="primary")
+        lf.pack(fill=tk.X, padx=5, pady=5)
+
+        # Header row
+        hdr = ttkb.Frame(lf)
+        hdr.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttkb.Label(hdr, text="Agent", width=14, anchor=tk.W,
+                   font=("Consolas", 8, "bold"), foreground="#aaaaaa").pack(side=tk.LEFT)
+        ttkb.Label(hdr, text="Signal", width=6, anchor=tk.CENTER,
+                   font=("Consolas", 8, "bold"), foreground="#aaaaaa").pack(side=tk.LEFT)
+        ttkb.Label(hdr, text="Score", width=10, anchor=tk.CENTER,
+                   font=("Consolas", 8, "bold"), foreground="#aaaaaa").pack(side=tk.LEFT)
+        ttkb.Label(hdr, text="Conf", width=5, anchor=tk.CENTER,
+                   font=("Consolas", 8, "bold"), foreground="#aaaaaa").pack(side=tk.LEFT)
+
+        self._agent_rows: dict[str, dict] = {}
+        agent_names = ["TrendAgent", "MomentumAgent", "VolatilityAgent", "VolumeAgent"]
+        for name in agent_names:
+            row = ttkb.Frame(lf)
+            row.pack(fill=tk.X, padx=4, pady=1)
+            lbl_name = ttkb.Label(row, text=name, width=14, anchor=tk.W,
+                                  font=("Consolas", 8), foreground="#cccccc")
+            lbl_name.pack(side=tk.LEFT)
+            lbl_action = ttkb.Label(row, text="---", width=6, anchor=tk.CENTER,
+                                    font=("Consolas", 8, "bold"), foreground="#aaaaaa")
+            lbl_action.pack(side=tk.LEFT)
+            lbl_bar = ttkb.Label(row, text="░░░░░░░░", width=10, anchor=tk.CENTER,
+                                 font=("Consolas", 8), foreground="#555555")
+            lbl_bar.pack(side=tk.LEFT)
+            lbl_conf = ttkb.Label(row, text="0%", width=5, anchor=tk.CENTER,
+                                  font=("Consolas", 8), foreground="#aaaaaa")
+            lbl_conf.pack(side=tk.LEFT)
+            self._agent_rows[name] = {
+                "action": lbl_action, "bar": lbl_bar, "conf": lbl_conf
+            }
+
+        # Separator
+        ttkb.Separator(lf, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=4, pady=3)
+
+        # Composer result row
+        comp_row = ttkb.Frame(lf)
+        comp_row.pack(fill=tk.X, padx=4, pady=(0, 4))
+        ttkb.Label(comp_row, text="DECISION", width=14, anchor=tk.W,
+                   font=("Consolas", 8, "bold"), foreground="#ffffff").pack(side=tk.LEFT)
+        self.lbl_composer_action = ttkb.Label(
+            comp_row, text="HOLD", width=6, anchor=tk.CENTER,
+            font=("Consolas", 9, "bold"), foreground="#aaaaaa"
+        )
+        self.lbl_composer_action.pack(side=tk.LEFT)
+        self.lbl_composer_mode = ttkb.Label(
+            comp_row, text="", width=15, anchor=tk.W,
+            font=("Consolas", 7), foreground="#666666"
+        )
+        self.lbl_composer_mode.pack(side=tk.LEFT, padx=(4, 0))
+
+    def _update_agent_panel_threadsafe(self, signals: list, decision):
+        """Thread-safe callback — schedules update on the Tk main thread."""
+        self.root.after(0, lambda: self._update_agent_panel(signals, decision))
+
+    def _update_agent_panel(self, signals: list, decision):
+        """Update agent signal rows and composer decision display."""
+        ACTION_COLORS = {
+            "BUY": ACCENT_GREEN,
+            "SELL": ACCENT_RED,
+            "HOLD": "#aaaaaa",
+        }
+        for sig in signals:
+            row = self._agent_rows.get(sig.agent_name)
+            if row is None:
+                continue
+            color = ACTION_COLORS.get(sig.action, "#aaaaaa")
+            if sig.error:
+                row["action"].configure(text="ERR", foreground="#ff8800")
+                row["bar"].configure(text="░░░░░░░░", foreground="#555555")
+                row["conf"].configure(text="0%")
+            else:
+                bar = self._make_score_bar(sig.score)
+                row["action"].configure(text=sig.action, foreground=color)
+                row["bar"].configure(text=bar, foreground=color)
+                row["conf"].configure(text=f"{int(sig.confidence * 100)}%")
+
+        if decision is not None:
+            color = ACTION_COLORS.get(decision.action, "#aaaaaa")
+            self.lbl_composer_action.configure(
+                text=decision.action, foreground=color
+            )
+            self.lbl_composer_mode.configure(text=decision.mode)
+
+    @staticmethod
+    def _make_score_bar(score: float, width: int = 8) -> str:
+        """Return a simple text bar representing |score| (0–1 range)."""
+        filled = int(min(abs(score), 1.0) * width)
+        return "█" * filled + "░" * (width - filled)
 
     def _update_key_hint(self):
         provider = self.cmb_provider.get()
@@ -661,6 +771,8 @@ class JeaniroTrabotApp:
         self.chart_mgr.toggle_sma20(self.var_sma20.get())
         self.chart_mgr.toggle_sma50(self.var_sma50.get())
         self.chart_mgr.toggle_rsi(self.var_rsi.get())
+        self.chart_mgr.toggle_macd(self.var_macd.get())
+        self.chart_mgr.toggle_bb(self.var_bb.get())
 
         def do_chart():
             df = self.connector.get_ohlcv(symbol, tf, count=100)
