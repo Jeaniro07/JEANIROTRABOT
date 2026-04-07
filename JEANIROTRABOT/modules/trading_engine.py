@@ -40,6 +40,133 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
+def compute_ema(series: pd.Series, period: int) -> pd.Series:
+    """Exponential Moving Average."""
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def compute_macd(
+    series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD line, Signal line, Histogram."""
+    ema_fast = compute_ema(series, fast)
+    ema_slow = compute_ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = compute_ema(macd_line, signal)
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def compute_stochastic(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    k_period: int = 14, d_period: int = 3
+) -> tuple[pd.Series, pd.Series]:
+    """Stochastic %K and %D."""
+    lowest_low = low.rolling(window=k_period).min()
+    highest_high = high.rolling(window=k_period).max()
+    denom = (highest_high - lowest_low).replace(0, np.nan)
+    stoch_k = 100.0 * (close - lowest_low) / denom
+    stoch_d = stoch_k.rolling(window=d_period).mean()
+    return stoch_k, stoch_d
+
+
+def compute_bollinger_bands(
+    series: pd.Series, period: int = 20, std_dev: float = 2.0
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Upper band, Mid (SMA), Lower band, Width."""
+    mid = series.rolling(window=period).mean()
+    std = series.rolling(window=period).std()
+    upper = mid + std_dev * std
+    lower = mid - std_dev * std
+    width = upper - lower
+    return upper, mid, lower, width
+
+
+def compute_atr(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
+    """Average True Range."""
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
+
+
+def compute_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume."""
+    direction = close.diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+    return (direction * volume).cumsum()
+
+
+def _safe_last(series: pd.Series) -> Optional[float]:
+    """Ambil nilai terakhir series, return None jika NaN."""
+    val = series.iloc[-1]
+    return float(val) if not pd.isna(val) else None
+
+
+def _safe_prev(series: pd.Series, n: int = 1) -> Optional[float]:
+    """Ambil nilai sebelumnya, return None jika NaN atau index OOB."""
+    if len(series) <= n:
+        return None
+    val = series.iloc[-1 - n]
+    return float(val) if not pd.isna(val) else None
+
+
+def compute_all_indicators(df: pd.DataFrame) -> dict:
+    """
+    Hitung semua indikator dari DataFrame OHLCV.
+    Return dict dengan semua nilai terakhir (float atau None jika NaN).
+    """
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    volume = df["Volume"]
+
+    sma20 = compute_sma(close, 20)
+    sma50 = compute_sma(close, 50)
+    ema9 = compute_ema(close, 9)
+    rsi = compute_rsi(close, 14)
+    macd, macd_signal, macd_hist = compute_macd(close)
+    stoch_k, stoch_d = compute_stochastic(high, low, close)
+    bb_upper, bb_mid, bb_lower, bb_width = compute_bollinger_bands(close)
+    atr = compute_atr(high, low, close)
+    atr_ma = atr.rolling(window=20).mean()
+    obv = compute_obv(close, volume)
+    volume_sma = volume.rolling(window=20).mean()
+
+    return {
+        "sma20":          _safe_last(sma20),
+        "sma50":          _safe_last(sma50),
+        "ema9":           _safe_last(ema9),
+        "rsi":            _safe_last(rsi),
+        "macd":           _safe_last(macd),
+        "macd_signal":    _safe_last(macd_signal),
+        "macd_hist":      _safe_last(macd_hist),
+        "macd_hist_prev": _safe_prev(macd_hist),
+        "stoch_k":        _safe_last(stoch_k),
+        "stoch_d":        _safe_last(stoch_d),
+        "stoch_k_prev":   _safe_prev(stoch_k),
+        "stoch_d_prev":   _safe_prev(stoch_d),
+        "bb_upper":       _safe_last(bb_upper),
+        "bb_mid":         _safe_last(bb_mid),
+        "bb_lower":       _safe_last(bb_lower),
+        "bb_width":       _safe_last(bb_width),
+        "bb_width_prev":  _safe_prev(bb_width),
+        "atr":            _safe_last(atr),
+        "atr_avg":        _safe_last(atr_ma),
+        "obv":            _safe_last(obv),
+        "obv_prev":       _safe_prev(obv),
+        "volume":         _safe_last(volume),
+        "volume_sma":     _safe_last(volume_sma),
+        "close":          _safe_last(close),
+        "close_prev":     _safe_prev(close),
+        "sma20_prev":     _safe_prev(sma20),
+        "sma50_prev":     _safe_prev(sma50),
+        "ema9_prev":      _safe_prev(ema9),
+    }
+
+
 class TradingEngine:
     """Full autonomous trading: AI decides, engine executes without confirmation."""
 
