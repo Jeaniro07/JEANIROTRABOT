@@ -15,6 +15,8 @@ import pandas as pd
 from modules.mt5_connector import MT5Connector, OrderResult
 from modules.risk_manager import RiskManager
 from modules.ai_agent import AIAgent
+from modules.specialist_agents import SpecialistPool, AgentSignal
+from modules.composer_agent import ComposerAgent, FinalDecision
 
 logger = logging.getLogger("JEANIROTRABOT.engine")
 
@@ -190,6 +192,13 @@ class TradingEngine:
         self._log_callback: Optional[Callable[[str], None]] = None
         self._interval = 5
 
+        # MiroFish-style agent pool + composer
+        self._pool = SpecialistPool()
+        self._composer = ComposerAgent()
+        self._last_signals: list[AgentSignal] = []
+        self._last_decision: Optional[FinalDecision] = None
+        self._signal_callback: Optional[Callable[[list, object], None]] = None
+
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
@@ -210,6 +219,10 @@ class TradingEngine:
     def set_log_callback(self, cb: Callable[[str], None]):
         self._log_callback = cb
 
+    def set_signal_callback(self, cb: Callable[[list, object], None]):
+        """Callback dipanggil setiap cycle dengan (signals, decision) untuk GUI update."""
+        self._signal_callback = cb
+
     def _log(self, msg: str):
         logger.info(msg)
         if self._log_callback:
@@ -217,6 +230,110 @@ class TradingEngine:
                 self._log_callback(msg)
             except Exception:
                 pass
+
+    def _log_agent_signals(self, symbol: str, signals: list[AgentSignal], decision: FinalDecision):
+        """Log sinyal semua agent + keputusan composer dan update GUI."""
+        for sig in signals:
+            status = "ERROR" if sig.error else sig.action
+            self._log(
+                f"[{sig.agent_name}] {status} score={sig.score:+.2f} "
+                f"conf={sig.confidence:.2f} — {'; '.join(sig.reasons[:2])}"
+            )
+        self._log(
+            f"[COMPOSER] {decision.mode} -> {decision.action} "
+            f"score={decision.score:+.2f} conf={decision.confidence:.2f} "
+            f"({decision.vote_summary})"
+        )
+        self._last_signals = signals
+        self._last_decision = decision
+        if self._signal_callback:
+            try:
+                self._signal_callback(signals, decision)
+            except Exception:
+                pass
+
+    def _execute_decision(
+        self,
+        decision: FinalDecision,
+        symbol: str,
+        symbol_info: Optional[dict],
+        total_positions: int,
+        symbol_pos_count: int,
+    ):
+        """Eksekusi FinalDecision dari ComposerAgent — mapping ke MT5 orders."""
+        action = decision.action
+        confidence = decision.confidence
+
+        if action == "HOLD":
+            return
+
+        if action in ("BUY", "SELL"):
+            if confidence < 0.6:
+                self._log(f"Skipping {action}: confidence {confidence:.2f} < 0.6")
+                return
+
+            ok, msg = self.risk.can_open_position(total_positions, symbol_pos_count)
+            if not ok:
+                self._log(f"Skipping {action}: {msg}")
+                return
+
+            if decision.lot_size > 0:
+                lot = self.risk.validate_lot_size(decision.lot_size)
+            elif symbol_info:
+                sl_pts = decision.sl_points if decision.sl_points > 0 else self.risk.default_sl_points
+                lot = self.risk.calculate_lot_size(
+                    equity=0,
+                    sl_points=sl_pts,
+                    tick_value=symbol_info.get("trade_tick_value", 1),
+                    tick_size=symbol_info.get("trade_tick_size", 1),
+                )
+            else:
+                lot = self.risk.validate_lot_size(self._lot_size)
+
+            sl = decision.sl_points if decision.sl_points > 0 else self.risk.default_sl_points
+            tp = decision.tp_points if decision.tp_points > 0 else self.risk.default_tp_points
+
+            self._log(f"AUTO-EXECUTE [{decision.mode}]: {action} {lot} {symbol} SL={sl} TP={tp}")
+            order_result = self.connector.send_market_order(
+                symbol=symbol, order_type=action.lower(),
+                volume=lot, sl_points=sl, tp_points=tp,
+            )
+            if order_result.success:
+                self.risk.record_order()
+                self._log(f"Order filled: ticket={order_result.ticket} @ {order_result.price}")
+            else:
+                self._log(f"Order failed: {order_result.comment}")
+
+        elif action == "CLOSE":
+            ticket = decision.ticket
+            if not ticket:
+                self._log("CLOSE action missing ticket.")
+                return
+            self._log(f"AUTO-CLOSE: ticket #{ticket}")
+            close_result = self.connector.close_position(ticket)
+            if close_result.success:
+                self._log(f"Closed #{ticket} @ {close_result.price}")
+            else:
+                self._log(f"Close failed: {close_result.comment}")
+
+        elif action == "CLOSE_ALL":
+            self._log(f"AUTO-CLOSE_ALL: {symbol}")
+            results = self.connector.close_positions_by_symbol(symbol)
+            for r in results:
+                status = f"Closed #{r.ticket} @ {r.price}" if r.success else f"Failed: {r.comment}"
+                self._log(f"  {status}")
+
+        elif action == "MODIFY_SL_TP":
+            ticket = decision.ticket
+            if not ticket:
+                self._log("MODIFY_SL_TP missing ticket.")
+                return
+            self._log(f"AUTO-MODIFY: #{ticket} SL={decision.new_sl} TP={decision.new_tp}")
+            mod_result = self.connector.modify_position_sl_tp(ticket, decision.new_sl, decision.new_tp)
+            if mod_result.success:
+                self._log(f"Position #{ticket} SL/TP modified.")
+            else:
+                self._log(f"Modify failed: {mod_result.comment}")
 
     def start(self) -> tuple[bool, str]:
         if self.running:
@@ -311,65 +428,62 @@ class TradingEngine:
 
     def _process_symbol(self, symbol: str, account, all_positions: list,
                         risk_status: dict, total_positions: int):
-        """Process a single symbol: fetch data → AI analysis → execute."""
-        # Fetch OHLCV
-        df = self.connector.get_ohlcv(symbol, self._timeframe, count=100)
-        if df is None or len(df) < 50:
+        """Process satu symbol: fetch data -> indicators -> specialist pool -> composer -> execute."""
+        # 1. Fetch OHLCV (minimal 60 candle untuk semua indikator)
+        df = self.connector.get_ohlcv(symbol, self._timeframe, count=150)
+        if df is None or len(df) < 60:
+            self._log(f"[{symbol}] Insufficient data ({len(df) if df is not None else 0} candles)")
             return
 
-        # Compute indicators
-        df["SMA20"] = compute_sma(df["Close"], 20)
-        df["SMA50"] = compute_sma(df["Close"], 50)
-        df["RSI"] = compute_rsi(df["Close"], 14)
+        # 2. Compute all indicators
+        indicators = compute_all_indicators(df)
 
-        latest = df.iloc[-1]
-        sma20 = latest["SMA20"]
-        sma50 = latest["SMA50"]
-        rsi = latest["RSI"]
-
-        if pd.isna(sma20) or pd.isna(sma50) or pd.isna(rsi):
+        # Validasi indikator kritis
+        if indicators["sma20"] is None or indicators["rsi"] is None:
+            self._log(f"[{symbol}] Core indicators NaN, skipping cycle")
             return
 
+        # 3. Get market data
         tick = self.connector.get_tick(symbol)
         if not tick:
             return
 
-        # Get symbol info
         symbol_info = self.connector.get_symbol_info(symbol)
-
-        # Symbol-specific positions
         symbol_positions = [p for p in all_positions if p["symbol"] == symbol]
 
-        # Determine signal
-        if self.ai.enabled:
-            spread = symbol_info.get("spread", 0) if symbol_info else 0
-            ohlcv_summary = df.tail(10).to_string()
-            result = self.ai.analyze(
-                symbol=symbol,
-                timeframe=self._timeframe,
-                ohlcv_summary=ohlcv_summary,
-                sma20=sma20, sma50=sma50, rsi=rsi,
-                bid=tick["bid"], ask=tick["ask"],
-                account_equity=account.equity,
-                account_balance=account.balance,
-                free_margin=account.free_margin,
-                open_positions=symbol_positions,
-                spread=spread,
-                risk_status=risk_status,
-                symbol_info=symbol_info,
-            )
-            self._log(
-                f"AI [{symbol}]: {result['action']} (conf={result['confidence']:.2f}) "
-                f"– {result['reason']}"
-            )
-            self._execute_ai_decision(result, symbol, symbol_info, total_positions,
-                                       len(symbol_positions))
-        else:
-            # Fallback: basic SMA crossover strategy
-            signal = self._basic_strategy(df, sma20, sma50, rsi)
-            if signal in ("BUY", "SELL"):
-                self._execute_basic_signal(signal, symbol, total_positions,
-                                           len(symbol_positions))
+        # 4. Run specialist pool (MiroFish agent pool style)
+        signals = self._pool.analyze(indicators, tick, symbol_info)
+
+        # 5. Build market context untuk LLM conflict resolution
+        ohlcv_summary = df.tail(10).to_string()
+        market_context = {
+            "symbol":          symbol,
+            "timeframe":       self._timeframe,
+            "ohlcv_summary":   ohlcv_summary,
+            "sma20":           indicators["sma20"],
+            "sma50":           indicators["sma50"] or 0.0,
+            "rsi":             indicators["rsi"],
+            "bid":             tick["bid"],
+            "ask":             tick["ask"],
+            "account_equity":  account.equity,
+            "account_balance": account.balance,
+            "free_margin":     account.free_margin,
+            "open_positions":  symbol_positions,
+            "spread":          symbol_info.get("spread", 0) if symbol_info else 0,
+            "risk_status":     risk_status,
+            "symbol_info":     symbol_info,
+        }
+
+        # 6. Composer decide (MiroFish ReportAgent style)
+        ai_agent = self.ai if self.ai.enabled else None
+        decision = self._composer.decide(signals, market_context, ai_agent)
+
+        # 7. Log + notify GUI
+        self._log_agent_signals(symbol, signals, decision)
+
+        # 8. Execute decision
+        self._execute_decision(decision, symbol, symbol_info,
+                                total_positions, len(symbol_positions))
 
     def _execute_ai_decision(self, result: dict, symbol: str, symbol_info: dict,
                               total_positions: int, symbol_pos_count: int):
