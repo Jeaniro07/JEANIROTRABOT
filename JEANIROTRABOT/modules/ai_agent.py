@@ -344,6 +344,104 @@ class AIAgent:
             default["reason"] = f"AI error: {str(e)}"
             return default
 
+    def analyze_multi(
+        self,
+        conflict_summary: str,
+        symbol: str = "",
+        timeframe: str = "",
+        ohlcv_summary: str = "",
+        sma20: float = 0.0,
+        sma50: float = 0.0,
+        rsi: float = 50.0,
+        bid: float = 0.0,
+        ask: float = 0.0,
+        account_equity: float = 0.0,
+        account_balance: float = 0.0,
+        free_margin: float = 0.0,
+        open_positions: list = None,
+        spread: float = 0.0,
+        risk_status: dict = None,
+        symbol_info: dict = None,
+        **kwargs,
+    ) -> dict:
+        """
+        Conflict resolution: kirim rangkuman sinyal agent yang conflict +
+        market context ke LLM, minta keputusan final.
+        Dipanggil oleh ComposerAgent hanya saat terjadi conflict.
+        """
+        default = {"action": "HOLD", "confidence": 0.0,
+                   "reason": "LLM unavailable for conflict resolution", "raw_response": ""}
+
+        if not self._enabled:
+            default["reason"] = "AI agent is disabled."
+            return default
+
+        client = self._get_client()
+        if client is None:
+            default["reason"] = "No API client for conflict resolution."
+            return default
+
+        user_prompt = conflict_summary + "\n\n"
+        user_prompt += "=== MARKET DATA ===\n"
+        if symbol:
+            user_prompt += f"Symbol: {symbol}, Timeframe: {timeframe}\n"
+        if bid:
+            user_prompt += f"Bid: {bid}, Ask: {ask}, Spread: {spread:.1f} pts\n"
+        if sma20:
+            user_prompt += f"SMA(20): {sma20:.5f}, SMA(50): {sma50:.5f}, RSI(14): {rsi:.2f}\n"
+        if ohlcv_summary:
+            user_prompt += f"Recent OHLCV:\n{ohlcv_summary}\n"
+
+        if account_equity > 0:
+            user_prompt += (
+                f"\n=== ACCOUNT ===\n"
+                f"Balance: {account_balance:.2f}, Equity: {account_equity:.2f}\n"
+                f"Free Margin: {free_margin:.2f}\n"
+            )
+
+        if risk_status:
+            user_prompt += (
+                f"\n=== RISK ===\n"
+                f"Drawdown: {risk_status.get('drawdown_pct', 0):.2f}%  "
+                f"Orders today: {risk_status.get('orders_today', 0)}/"
+                f"{risk_status.get('max_orders_per_day', 20)}\n"
+            )
+
+        if open_positions:
+            user_prompt += f"\n=== OPEN POSITIONS ({len(open_positions)}) ===\n"
+            for p in open_positions:
+                user_prompt += (
+                    f"  #{p['ticket']}: {p['type']} {p['volume']} {p['symbol']} "
+                    f"P&L: {p['profit']:.2f}\n"
+                )
+
+        user_prompt += (
+            "\nResolve the agent conflict above. Provide your final trading decision as JSON. "
+            "Be decisive — pick the most supported action given all evidence."
+        )
+
+        try:
+            response = self._get_client().chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": self._system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=400,
+                temperature=0.2,
+            )
+            raw = response.choices[0].message.content.strip()
+            logger.info(f"AI [CONFLICT/{self._provider}/{self._model}]: {raw}")
+            parsed = self._parse_response(raw)
+            parsed["raw_response"] = raw
+            return parsed
+
+        except Exception as e:
+            logger.error(f"analyze_multi error ({self._provider}): {e}")
+            self._client = None
+            default["reason"] = f"LLM conflict error: {str(e)}"
+            return default
+
     def _parse_response(self, raw: str) -> dict:
         """Parse AI response JSON with extended action support."""
         text = raw.strip()
