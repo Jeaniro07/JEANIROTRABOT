@@ -17,6 +17,8 @@ import pandas as pd
 from modules.mt5_connector import MT5Connector, OrderResult
 from modules.risk_manager import RiskManager
 from modules.ai_agent import AIAgent
+from modules.specialist_agents import SpecialistPool, AgentSignal
+from modules.composer_agent import ComposerAgent, FinalDecision
 
 logger = logging.getLogger("JEANIROTRABOT.engine")
 
@@ -40,6 +42,133 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rsi[loss_zero] = 100.0
     rsi[normal] = 100.0 - (100.0 / (1.0 + avg_gain[normal] / avg_loss[normal]))
     return rsi
+
+
+def compute_ema(series: pd.Series, period: int) -> pd.Series:
+    """Exponential Moving Average."""
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def compute_macd(
+    series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD line, Signal line, Histogram."""
+    ema_fast = compute_ema(series, fast)
+    ema_slow = compute_ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = compute_ema(macd_line, signal)
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def compute_stochastic(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    k_period: int = 14, d_period: int = 3
+) -> tuple[pd.Series, pd.Series]:
+    """Stochastic %K and %D."""
+    lowest_low = low.rolling(window=k_period).min()
+    highest_high = high.rolling(window=k_period).max()
+    denom = (highest_high - lowest_low).replace(0, np.nan)
+    stoch_k = 100.0 * (close - lowest_low) / denom
+    stoch_d = stoch_k.rolling(window=d_period).mean()
+    return stoch_k, stoch_d
+
+
+def compute_bollinger_bands(
+    series: pd.Series, period: int = 20, std_dev: float = 2.0
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Upper band, Mid (SMA), Lower band, Width."""
+    mid = series.rolling(window=period).mean()
+    std = series.rolling(window=period).std()
+    upper = mid + std_dev * std
+    lower = mid - std_dev * std
+    width = upper - lower
+    return upper, mid, lower, width
+
+
+def compute_atr(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
+    """Average True Range."""
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
+
+
+def compute_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume."""
+    direction = close.diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+    return (direction * volume).cumsum()
+
+
+def _safe_last(series: pd.Series) -> Optional[float]:
+    """Ambil nilai terakhir series, return None jika NaN."""
+    val = series.iloc[-1]
+    return float(val) if not pd.isna(val) else None
+
+
+def _safe_prev(series: pd.Series, n: int = 1) -> Optional[float]:
+    """Ambil nilai sebelumnya, return None jika NaN atau index OOB."""
+    if len(series) <= n:
+        return None
+    val = series.iloc[-1 - n]
+    return float(val) if not pd.isna(val) else None
+
+
+def compute_all_indicators(df: pd.DataFrame) -> dict:
+    """
+    Hitung semua indikator dari DataFrame OHLCV.
+    Return dict dengan semua nilai terakhir (float atau None jika NaN).
+    """
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    volume = df["Volume"]
+
+    sma20 = compute_sma(close, 20)
+    sma50 = compute_sma(close, 50)
+    ema9 = compute_ema(close, 9)
+    rsi = compute_rsi(close, 14)
+    macd, macd_signal, macd_hist = compute_macd(close)
+    stoch_k, stoch_d = compute_stochastic(high, low, close)
+    bb_upper, bb_mid, bb_lower, bb_width = compute_bollinger_bands(close)
+    atr = compute_atr(high, low, close)
+    atr_ma = atr.rolling(window=20).mean()
+    obv = compute_obv(close, volume)
+    volume_sma = volume.rolling(window=20).mean()
+
+    return {
+        "sma20":          _safe_last(sma20),
+        "sma50":          _safe_last(sma50),
+        "ema9":           _safe_last(ema9),
+        "rsi":            _safe_last(rsi),
+        "macd":           _safe_last(macd),
+        "macd_signal":    _safe_last(macd_signal),
+        "macd_hist":      _safe_last(macd_hist),
+        "macd_hist_prev": _safe_prev(macd_hist),
+        "stoch_k":        _safe_last(stoch_k),
+        "stoch_d":        _safe_last(stoch_d),
+        "stoch_k_prev":   _safe_prev(stoch_k),
+        "stoch_d_prev":   _safe_prev(stoch_d),
+        "bb_upper":       _safe_last(bb_upper),
+        "bb_mid":         _safe_last(bb_mid),
+        "bb_lower":       _safe_last(bb_lower),
+        "bb_width":       _safe_last(bb_width),
+        "bb_width_prev":  _safe_prev(bb_width),
+        "atr":            _safe_last(atr),
+        "atr_avg":        _safe_last(atr_ma),
+        "obv":            _safe_last(obv),
+        "obv_prev":       _safe_prev(obv),
+        "volume":         _safe_last(volume),
+        "volume_sma":     _safe_last(volume_sma),
+        "close":          _safe_last(close),
+        "close_prev":     _safe_prev(close),
+        "sma20_prev":     _safe_prev(sma20),
+        "sma50_prev":     _safe_prev(sma50),
+        "ema9_prev":      _safe_prev(ema9),
+    }
 
 
 class TradingEngine:
@@ -73,12 +202,16 @@ class TradingEngine:
         self._daily_pnl: float = 0.0
         self._trade_count_today: int = 0
 
-        # Optional agents (diinisialisasi dari GUI atau di sini)
-        self._composer = None
+        # MiroFish-style specialist pool + MiroFish ComposerAgent
+        self._pool = SpecialistPool()
+        self._mirofish_composer = ComposerAgent()
+
+        # Optional orchestration agents (diinisialisasi dari GUI atau di sini)
+        self._composer = None   # MarketModeComposer (meta-orchestrator, HEAD)
         self._news_agent = None
         self._research_agent = None
 
-        # Composer state cache
+        # Composer state cache (for MarketModeComposer)
         self._composer_confidence_threshold: float = 0.6
         self._composer_lot_multiplier: float = 1.0
         self._composer_dynamic_prompt: str = ""
@@ -91,14 +224,19 @@ class TradingEngine:
         self._research_last_run: float = 0
         self._research_interval: int = config.get_int("RESEARCH_AGENT_INTERVAL", 60) * 60
 
-        # Cached summaries untuk Composer
+        # Cached summaries pentru Composer
         self._news_summary: str = ""
         self._research_summary: str = ""
         self._market_summary: str = ""
 
-        # Symbol cache untuk background scan (Fix I)
+        # Symbol cache pentru background scan (Fix I)
         self._available_symbols_cache: list = []
         self._agent_threads: list = []
+
+        # MiroFish signals/decision tracking
+        self._last_signals: list[AgentSignal] = []
+        self._last_decision: Optional[FinalDecision] = None
+        self._signal_callback: Optional[Callable[[list, object], None]] = None
 
     @property
     def running(self) -> bool:
@@ -131,6 +269,10 @@ class TradingEngine:
     def set_research_agent(self, research_agent):
         self._research_agent = research_agent
 
+    def set_signal_callback(self, cb: Callable[[list, object], None]):
+        """Callback dipanggil setiap cycle dengan (signals, decision) untuk GUI update."""
+        self._signal_callback = cb
+
     def _log(self, msg: str):
         logger.info(msg)
         if self._log_callback:
@@ -138,6 +280,110 @@ class TradingEngine:
                 self._log_callback(msg)
             except Exception:
                 pass
+
+    def _log_agent_signals(self, symbol: str, signals: list[AgentSignal], decision: FinalDecision):
+        """Log sinyal semua agent + keputusan composer dan update GUI."""
+        for sig in signals:
+            status = "ERROR" if sig.error else sig.action
+            self._log(
+                f"[{sig.agent_name}] {status} score={sig.score:+.2f} "
+                f"conf={sig.confidence:.2f} — {'; '.join(sig.reasons[:2])}"
+            )
+        self._log(
+            f"[COMPOSER] {decision.mode} -> {decision.action} "
+            f"score={decision.score:+.2f} conf={decision.confidence:.2f} "
+            f"({decision.vote_summary})"
+        )
+        self._last_signals = signals
+        self._last_decision = decision
+        if self._signal_callback:
+            try:
+                self._signal_callback(signals, decision)
+            except Exception:
+                pass
+
+    def _execute_decision(
+        self,
+        decision: FinalDecision,
+        symbol: str,
+        symbol_info: Optional[dict],
+        total_positions: int,
+        symbol_pos_count: int,
+    ):
+        """Eksekusi FinalDecision dari ComposerAgent — mapping ke MT5 orders."""
+        action = decision.action
+        confidence = decision.confidence
+
+        if action == "HOLD":
+            return
+
+        if action in ("BUY", "SELL"):
+            if confidence < 0.6:
+                self._log(f"Skipping {action}: confidence {confidence:.2f} < 0.6")
+                return
+
+            ok, msg = self.risk.can_open_position(total_positions, symbol_pos_count)
+            if not ok:
+                self._log(f"Skipping {action}: {msg}")
+                return
+
+            if decision.lot_size > 0:
+                lot = self.risk.validate_lot_size(decision.lot_size)
+            elif symbol_info:
+                sl_pts = decision.sl_points if decision.sl_points > 0 else self.risk.default_sl_points
+                lot = self.risk.calculate_lot_size(
+                    equity=0,
+                    sl_points=sl_pts,
+                    tick_value=symbol_info.get("trade_tick_value", 1),
+                    tick_size=symbol_info.get("trade_tick_size", 1),
+                )
+            else:
+                lot = self.risk.validate_lot_size(self._lot_size)
+
+            sl = decision.sl_points if decision.sl_points > 0 else self.risk.default_sl_points
+            tp = decision.tp_points if decision.tp_points > 0 else self.risk.default_tp_points
+
+            self._log(f"AUTO-EXECUTE [{decision.mode}]: {action} {lot} {symbol} SL={sl} TP={tp}")
+            order_result = self.connector.send_market_order(
+                symbol=symbol, order_type=action.lower(),
+                volume=lot, sl_points=sl, tp_points=tp,
+            )
+            if order_result.success:
+                self.risk.record_order()
+                self._log(f"Order filled: ticket={order_result.ticket} @ {order_result.price}")
+            else:
+                self._log(f"Order failed: {order_result.comment}")
+
+        elif action == "CLOSE":
+            ticket = decision.ticket
+            if not ticket:
+                self._log("CLOSE action missing ticket.")
+                return
+            self._log(f"AUTO-CLOSE: ticket #{ticket}")
+            close_result = self.connector.close_position(ticket)
+            if close_result.success:
+                self._log(f"Closed #{ticket} @ {close_result.price}")
+            else:
+                self._log(f"Close failed: {close_result.comment}")
+
+        elif action == "CLOSE_ALL":
+            self._log(f"AUTO-CLOSE_ALL: {symbol}")
+            results = self.connector.close_positions_by_symbol(symbol)
+            for r in results:
+                status = f"Closed #{r.ticket} @ {r.price}" if r.success else f"Failed: {r.comment}"
+                self._log(f"  {status}")
+
+        elif action == "MODIFY_SL_TP":
+            ticket = decision.ticket
+            if not ticket:
+                self._log("MODIFY_SL_TP missing ticket.")
+                return
+            self._log(f"AUTO-MODIFY: #{ticket} SL={decision.new_sl} TP={decision.new_tp}")
+            mod_result = self.connector.modify_position_sl_tp(ticket, decision.new_sl, decision.new_tp)
+            if mod_result.success:
+                self._log(f"Position #{ticket} SL/TP modified.")
+            else:
+                self._log(f"Modify failed: {mod_result.comment}")
 
     def start(self) -> tuple[bool, str]:
         if self.running:
@@ -580,75 +826,97 @@ class TradingEngine:
 
     def _process_symbol(self, symbol: str, account, all_positions: list,
                         risk_status: dict, total_positions: int):
-        """Process a single symbol: fetch data → AI analysis → execute."""
-        # Fetch OHLCV
-        df = self.connector.get_ohlcv(symbol, self._timeframe, count=100)
-        if df is None or len(df) < 50:
+        """Process satu symbol: fetch data -> indicators -> specialist pool -> composer -> execute."""
+        # 1. Fetch OHLCV (minimal 60 candle untuk semua indikator)
+        df = self.connector.get_ohlcv(symbol, self._timeframe, count=150)
+        if df is None or len(df) < 60:
+            self._log(f"[{symbol}] Insufficient data ({len(df) if df is not None else 0} candles)")
             return
 
-        # Compute indicators
-        df["SMA20"] = compute_sma(df["Close"], 20)
-        df["SMA50"] = compute_sma(df["Close"], 50)
-        df["RSI"] = compute_rsi(df["Close"], 14)
+        # 2. Compute all indicators
+        indicators = compute_all_indicators(df)
 
-        latest = df.iloc[-1]
-        sma20 = latest["SMA20"]
-        sma50 = latest["SMA50"]
-        rsi = latest["RSI"]
-
-        if pd.isna(sma20) or pd.isna(sma50) or pd.isna(rsi):
+        # Validasi indikator kritis
+        if indicators["sma20"] is None or indicators["rsi"] is None:
+            self._log(f"[{symbol}] Core indicators NaN, skipping cycle")
             return
 
+        # 3. Get market data
         tick = self.connector.get_tick(symbol)
         if not tick:
             return
 
-        # Get symbol info
         symbol_info = self.connector.get_symbol_info(symbol)
-
-        # Symbol-specific positions
         symbol_positions = [p for p in all_positions if p["symbol"] == symbol]
 
-        # Determine signal
-        if self.ai.enabled:
-            spread = symbol_info.get("spread", 0) if symbol_info else 0
-            ohlcv_summary = df.tail(10).to_string()
+        # 4. Run specialist pool (MiroFish agent pool style)
+        signals = self._pool.analyze(indicators, tick, symbol_info)
 
-            # Inject Composer's dynamic prompt jika ada
+        # 5. Build market context untuk LLM conflict resolution
+        ohlcv_summary = df.tail(10).to_string()
+        market_context = {
+            "symbol":          symbol,
+            "timeframe":       self._timeframe,
+            "ohlcv_summary":   ohlcv_summary,
+            "sma20":           indicators["sma20"],
+            "sma50":           indicators["sma50"] or 0.0,
+            "rsi":             indicators["rsi"],
+            "bid":             tick["bid"],
+            "ask":             tick["ask"],
+            "account_equity":  account.equity,
+            "account_balance": account.balance,
+            "free_margin":     account.free_margin,
+            "open_positions":  symbol_positions,
+            "spread":          symbol_info.get("spread", 0) if symbol_info else 0,
+            "risk_status":     risk_status,
+            "symbol_info":     symbol_info,
+        }
+
+        # 6. MiroFish ComposerAgent decide (consensus / conflict / fallback)
+        ai_agent = self.ai if self.ai.enabled else None
+        decision = self._mirofish_composer.decide(signals, market_context, ai_agent)
+
+        # 7. Log + notify GUI
+        self._log_agent_signals(symbol, signals, decision)
+
+        # 8. Execute MiroFish decision (maps BUY/SELL/HOLD/CLOSE/MODIFY to orders)
+        self._execute_decision(decision, symbol, symbol_info,
+                               total_positions, len(symbol_positions))
+
+        # 9. Also run direct AI analyze (HEAD path) for SCAN_MARKET / self-configure actions
+        #    and as a second opinion when AI is enabled and MarketModeComposer dynamic prompt is set.
+        if self.ai.enabled and self._composer_dynamic_prompt:
             original_prompt = self.ai.system_prompt
-            if self._composer_dynamic_prompt:
-                self.ai.system_prompt = self._composer_dynamic_prompt
-
+            self.ai.system_prompt = self._composer_dynamic_prompt
             result = self.ai.analyze(
                 symbol=symbol,
                 timeframe=self._timeframe,
                 ohlcv_summary=ohlcv_summary,
-                sma20=sma20, sma50=sma50, rsi=rsi,
+                sma20=indicators["sma20"] or 0.0,
+                sma50=indicators["sma50"] or 0.0,
+                rsi=indicators["rsi"] or 50.0,
                 bid=tick["bid"], ask=tick["ask"],
                 account_equity=account.equity,
                 account_balance=account.balance,
                 free_margin=account.free_margin,
                 open_positions=symbol_positions,
-                spread=spread,
+                spread=symbol_info.get("spread", 0) if symbol_info else 0,
                 risk_status=risk_status,
                 symbol_info=symbol_info,
             )
-            # Restore prompt asli
-            if self._composer_dynamic_prompt:
-                self.ai.system_prompt = original_prompt
-
-            self._log(
-                f"AI [{symbol}]: {result['action']} (conf={result['confidence']:.2f}) "
-                f"– {result['reason']}"
-            )
-            self._execute_ai_decision(result, symbol, symbol_info, total_positions,
-                                       len(symbol_positions))
-        else:
-            # Fallback: basic SMA crossover strategy
-            signal = self._basic_strategy(df, sma20, sma50, rsi)
-            if signal in ("BUY", "SELL"):
-                self._execute_basic_signal(signal, symbol, total_positions,
-                                           len(symbol_positions))
+            self.ai.system_prompt = original_prompt
+            # Only execute self-configure actions from this path (not BUY/SELL — MiroFish handles those)
+            self_configure_actions = {
+                "SCAN_MARKET", "SELECT_SYMBOLS", "SET_SESSION_END",
+                "EARLY_TP", "END_DAY", "SCALE_IN", "SCALE_OUT",
+            }
+            if result.get("action") in self_configure_actions:
+                self._log(
+                    f"AI SELF-CFG [{symbol}]: {result['action']} "
+                    f"(conf={result['confidence']:.2f}) – {result['reason']}"
+                )
+                self._execute_ai_decision(result, symbol, symbol_info, total_positions,
+                                          len(symbol_positions))
 
     def _execute_ai_decision(self, result: dict, symbol: str, symbol_info: dict,
                               total_positions: int, symbol_pos_count: int):

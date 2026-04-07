@@ -15,7 +15,9 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import mplfinance as mpf
 
-from modules.trading_engine import compute_sma, compute_rsi
+from modules.trading_engine import (
+    compute_sma, compute_rsi, compute_macd, compute_bollinger_bands
+)
 
 logger = logging.getLogger("JEANIROTRABOT.chart")
 
@@ -53,6 +55,8 @@ class ChartManager:
         self._show_sma20 = True
         self._show_sma50 = True
         self._show_rsi = True
+        self._show_macd = True
+        self._show_bb = True
 
     @property
     def figure(self) -> Optional[Figure]:
@@ -73,6 +77,12 @@ class ChartManager:
 
     def toggle_rsi(self, value: bool):
         self._show_rsi = value
+
+    def toggle_macd(self, value: bool):
+        self._show_macd = value
+
+    def toggle_bb(self, value: bool):
+        self._show_bb = value
 
     def render(self, df: pd.DataFrame, symbol: str = "", timeframe: str = "") -> Optional[Figure]:
         """
@@ -98,6 +108,15 @@ class ChartManager:
                 df["SMA50"], color="#ffaa00", width=1.2, label="SMA 50"
             ))
 
+        if self._show_bb:
+            bb_upper, bb_mid, bb_lower, _ = compute_bollinger_bands(df["Close"])
+            addplots.append(mpf.make_addplot(
+                bb_upper, color="#ff880055", width=0.8, linestyle="--", label="BB Upper"
+            ))
+            addplots.append(mpf.make_addplot(
+                bb_lower, color="#ff880055", width=0.8, linestyle="--", label="BB Lower"
+            ))
+
         if self._show_rsi:
             df["RSI"] = compute_rsi(df["Close"], 14)
             addplots.append(mpf.make_addplot(
@@ -114,13 +133,36 @@ class ChartManager:
                 rsi_30, panel=2, color="#00ff8888", width=0.5, linestyle="--"
             ))
 
+        if self._show_macd:
+            macd_line, signal_line, histogram = compute_macd(df["Close"])
+            macd_panel = 3 if self._show_rsi else 2
+            addplots.append(mpf.make_addplot(
+                macd_line, panel=macd_panel, color="#00bfff", width=1.0, label="MACD"
+            ))
+            addplots.append(mpf.make_addplot(
+                signal_line, panel=macd_panel, color="#ff8800", width=1.0, label="Signal"
+            ))
+            hist_colors = ["#00ff8855" if v >= 0 else "#ff444455"
+                           for v in histogram.fillna(0)]
+            addplots.append(mpf.make_addplot(
+                histogram, panel=macd_panel, type="bar",
+                color=hist_colors, label="Hist"
+            ))
+
         title = f"{symbol} {timeframe}" if symbol else "Chart"
 
         # Close previous figure
         if self._figure:
             plt.close(self._figure)
 
-        panel_ratios = (4, 1, 2) if self._show_rsi else (4, 1)
+        if self._show_rsi and self._show_macd:
+            panel_ratios = (4, 1, 2, 2)
+        elif self._show_rsi:
+            panel_ratios = (4, 1, 2)
+        elif self._show_macd:
+            panel_ratios = (4, 1, 2)
+        else:
+            panel_ratios = (4, 1)
 
         fig, axes = mpf.plot(
             df,
