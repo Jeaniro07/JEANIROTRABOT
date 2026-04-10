@@ -69,6 +69,10 @@ DEFAULTS = {
     # Composer Agent (new)
     "COMPOSER_ENABLED": "true",
     "COMPOSER_INTERVAL": "5",          # menit (Fix E: 10 → 5)
+    # Fast decision pipeline
+    "TRADE_INTERVAL":       "2",   # detik antar siklus loop (dari 5)
+    "DECISION_CACHE_TTL":   "30",  # detik keputusan berlaku di cache
+    "LLM_CONFLICT_TIMEOUT": "5",   # detik timeout LLM conflict call
     "PROFIT_TARGET_PERCENT": "70.0",
     "INITIAL_BALANCE_SNAPSHOT": "",
 }
