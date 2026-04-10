@@ -23,7 +23,7 @@ from modules.specialist_agents import AgentSignal
 logger = logging.getLogger("JEANIROTRABOT.composer")
 
 CONFLICT_SCORE_THRESHOLD = 0.30   # avg score minimum untuk consensus tanpa LLM
-LLM_DEFAULT_TIMEOUT = 10.0        # detik
+LLM_DEFAULT_TIMEOUT = 5.0         # detik
 
 
 # ─────────────────────────────────────────────
@@ -190,6 +190,7 @@ class ComposerAgent:
 
         try:
             result = ai_agent.analyze_multi(
+                timeout=LLM_DEFAULT_TIMEOUT,
                 conflict_summary=conflict_summary,
                 **{k: v for k, v in market_context.items()},
             )
