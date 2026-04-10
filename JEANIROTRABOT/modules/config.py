@@ -120,6 +120,10 @@ class AppConfig:
         except (ValueError, TypeError):
             return default
 
+    def get_bool(self, key: str, default: bool = False) -> bool:
+        val = self._config.get(key, str(default)).strip().lower()
+        return val in ("true", "1", "yes", "on")
+
     def save(self) -> None:
         """Auto-save config to JSON file."""
         try:

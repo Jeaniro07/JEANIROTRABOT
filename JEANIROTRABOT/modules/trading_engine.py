@@ -193,7 +193,9 @@ class TradingEngine:
         self._timeframe = "M5"
         self._lot_size = 0.01
         self._log_callback: Optional[Callable[[str], None]] = None
-        self._interval = 5
+        self._interval  = config.get_int("TRADE_INTERVAL", 2)    # detik (dari 5)
+        self._cache_ttl = config.get_int("DECISION_CACHE_TTL", 30)  # detik
+        self._decision_cache: dict = {}  # {symbol: (FinalDecision, timestamp)}
 
         # Self-configure state
         self._session_end_time: Optional[str] = config.get("AI_SESSION_END_TIME", "") or None
@@ -254,6 +256,21 @@ class TradingEngine:
 
     def set_lot_size(self, lot: float):
         self._lot_size = lot
+
+    def _get_cached_decision(self, symbol: str):
+        """Return cached FinalDecision jika masih valid, else None."""
+        entry = self._decision_cache.get(symbol)
+        if entry is None:
+            return None
+        decision, ts = entry
+        if time.time() - ts > self._cache_ttl:
+            del self._decision_cache[symbol]
+            return None
+        return decision
+
+    def _cache_decision(self, symbol: str, decision) -> None:
+        """Simpan decision ke cache dengan timestamp sekarang."""
+        self._decision_cache[symbol] = (decision, time.time())
 
     def set_log_callback(self, cb: Callable[[str], None]):
         self._log_callback = cb
@@ -849,6 +866,12 @@ class TradingEngine:
         symbol_info = self.connector.get_symbol_info(symbol)
         symbol_positions = [p for p in all_positions if p["symbol"] == symbol]
 
+        # 3b. Decision cache — skip pipeline jika HOLD masih berlaku
+        cached = self._get_cached_decision(symbol)
+        if cached is not None and cached.action == "HOLD":
+            self._log(f"[{symbol}] Cache HIT: HOLD (mode={cached.mode}) — skip pipeline")
+            return  # HOLD berulang tidak perlu recompute agents
+
         # 4. Run specialist pool (MiroFish agent pool style)
         signals = self._pool.analyze(indicators, tick, symbol_info)
 
@@ -875,6 +898,9 @@ class TradingEngine:
         # 6. MiroFish ComposerAgent decide (consensus / conflict / fallback)
         ai_agent = self.ai if self.ai.enabled else None
         decision = self._mirofish_composer.decide(signals, market_context, ai_agent)
+
+        # 6b. Simpan keputusan ke cache
+        self._cache_decision(symbol, decision)
 
         # 7. Log + notify GUI
         self._log_agent_signals(symbol, signals, decision)

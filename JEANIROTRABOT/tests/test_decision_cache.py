@@ -107,3 +107,80 @@ class TestLlmTimeoutFallback:
 
         decision = composer.decide(signals, {"symbol": "EURUSD"}, ai_agent=mock_ai)
         assert decision.mode == "MAJORITY_FALLBACK"
+
+
+# ──────────────────────────────────────────────
+# Task 4 tests — DecisionCache
+# ──────────────────────────────────────────────
+
+class TestDecisionCache:
+    """_get_cached_decision() dan _cache_decision() harus bekerja dengan benar."""
+
+    def _make_engine(self):
+        """Buat TradingEngine minimal dengan semua dependency di-mock."""
+        from modules.trading_engine import TradingEngine
+        from modules.config import AppConfig
+        mock_connector = MagicMock()
+        mock_risk      = MagicMock()
+        mock_ai        = MagicMock()
+        mock_config    = MagicMock(spec=AppConfig)
+        mock_config.get.return_value = ""
+        mock_config.get_int.side_effect = lambda key, default=0: default
+        mock_config.get_float.side_effect = lambda key, default=0.0: default
+        mock_config.get_bool.side_effect = lambda key, default=False: default
+        return TradingEngine(mock_connector, mock_risk, mock_ai, mock_config)
+
+    def _make_hold_decision(self):
+        return FinalDecision(
+            action="HOLD", confidence=0.5, score=0.0,
+            reason="test", mode="CONSENSUS", vote_summary="4 HOLD",
+        )
+
+    def _make_buy_decision(self):
+        return FinalDecision(
+            action="BUY", confidence=0.8, score=0.7,
+            reason="test", mode="CONSENSUS", vote_summary="3 BUY 1 HOLD",
+        )
+
+    def test_cache_miss_returns_none(self):
+        """Symbol yang belum pernah diproses harus return None."""
+        engine = self._make_engine()
+        result = engine._get_cached_decision("EURUSD")
+        assert result is None
+
+    def test_cache_hit_returns_decision(self):
+        """Setelah _cache_decision(), _get_cached_decision() harus return decision yang sama."""
+        engine = self._make_engine()
+        decision = self._make_hold_decision()
+        engine._cache_decision("EURUSD", decision)
+        result = engine._get_cached_decision("EURUSD")
+        assert result is not None
+        assert result.action == "HOLD"
+        assert result.mode == "CONSENSUS"
+
+    def test_cache_ttl_expires(self):
+        """Setelah TTL habis, _get_cached_decision() harus return None."""
+        engine = self._make_engine()
+        engine._cache_ttl = 1  # 1 detik untuk test cepat
+        decision = self._make_hold_decision()
+        engine._cache_decision("EURUSD", decision)
+        time.sleep(1.1)  # tunggu TTL habis
+        result = engine._get_cached_decision("EURUSD")
+        assert result is None, "Cache harus expired setelah TTL"
+
+    def test_different_symbols_cached_independently(self):
+        """Cache EURUSD tidak boleh mempengaruhi cache XAUUSD."""
+        engine = self._make_engine()
+        engine._cache_decision("EURUSD", self._make_hold_decision())
+        engine._cache_decision("XAUUSD", self._make_buy_decision())
+        assert engine._get_cached_decision("EURUSD").action == "HOLD"
+        assert engine._get_cached_decision("XAUUSD").action == "BUY"
+        assert engine._get_cached_decision("BTCUSD") is None
+
+    def test_cache_overwrite(self):
+        """_cache_decision() yang dipanggil dua kali harus overwrite entry lama."""
+        engine = self._make_engine()
+        engine._cache_decision("EURUSD", self._make_hold_decision())
+        engine._cache_decision("EURUSD", self._make_buy_decision())
+        result = engine._get_cached_decision("EURUSD")
+        assert result.action == "BUY", "Entry lama harus tertimpa"
