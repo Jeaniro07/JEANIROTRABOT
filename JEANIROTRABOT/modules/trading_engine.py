@@ -206,7 +206,9 @@ class TradingEngine:
 
         # MiroFish-style specialist pool + MiroFish ComposerAgent
         self._pool = SpecialistPool()
-        self._mirofish_composer = ComposerAgent()
+        self._mirofish_composer = ComposerAgent(
+            llm_timeout=config.get_float("LLM_CONFLICT_TIMEOUT", 5.0)
+        )
 
         # Optional orchestration agents (diinisialisasi dari GUI atau di sini)
         self._composer = None   # MarketModeComposer (meta-orchestrator, HEAD)

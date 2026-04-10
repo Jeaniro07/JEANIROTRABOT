@@ -190,7 +190,7 @@ class ComposerAgent:
 
         try:
             result = ai_agent.analyze_multi(
-                timeout=LLM_DEFAULT_TIMEOUT,
+                timeout=self._llm_timeout,
                 conflict_summary=conflict_summary,
                 **{k: v for k, v in market_context.items()},
             )
