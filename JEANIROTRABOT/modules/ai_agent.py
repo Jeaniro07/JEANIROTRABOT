@@ -437,6 +437,7 @@ class AIAgent:
         spread: float = 0.0,
         risk_status: dict = None,
         symbol_info: dict = None,
+        timeout: float = 5.0,
         **kwargs,
     ) -> dict:
         """
@@ -446,10 +447,6 @@ class AIAgent:
         """
         default = {"action": "HOLD", "confidence": 0.0,
                    "reason": "LLM unavailable for conflict resolution", "raw_response": ""}
-
-        if not self._enabled:
-            default["reason"] = "AI agent is disabled."
-            return default
 
         client = self._get_client()
         if client is None:
@@ -496,7 +493,7 @@ class AIAgent:
         )
 
         try:
-            response = self._get_client().chat.completions.create(
+            response = client.chat.completions.create(
                 model=self._model,
                 messages=[
                     {"role": "system", "content": self._system_prompt},
@@ -504,6 +501,7 @@ class AIAgent:
                 ],
                 max_tokens=400,
                 temperature=0.2,
+                timeout=timeout,
             )
             raw = response.choices[0].message.content.strip()
             logger.info(f"AI [CONFLICT/{self._provider}/{self._model}]: {raw}")
